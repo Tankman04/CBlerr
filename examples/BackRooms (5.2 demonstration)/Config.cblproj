@@ -1,0 +1,6 @@
+[project]
+name = BackRooms_ico
+main_file = BackRooms.cbl
+ui = 0
+icon = shortcut.ico
+; files = libs/stb_image.c, libs/noise.c

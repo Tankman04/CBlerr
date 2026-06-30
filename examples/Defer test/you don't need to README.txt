@@ -1,0 +1,1 @@
+Yo i added defer for yall not forgetting about free, like in zig or idk where too, i think... C99? idk

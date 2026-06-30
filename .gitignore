@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build
+dist/
+*.spec
+*.pkg
+*.toc
+*.log
+
+# IDE
+.vscode/
+.idea/
+.qodo/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Backups
+*.bundle
+*.bak
+*.zip
+*.rar

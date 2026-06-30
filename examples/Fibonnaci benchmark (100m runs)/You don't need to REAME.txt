@@ -1,0 +1,4 @@
+This program highlights the maximum speed capability of 
+CBlerr to calculate 100M Fibonacci numbers in one shot, with an average running time of around 7 tacts on I7 12 gen.
+
+What's interesting, AVX256 or AVX128 does not make the programm faster. Actually it makes it slower lol.
