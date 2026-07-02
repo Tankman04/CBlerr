@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from core.flux_ast import (
     Program, FunctionDef, Return, BinaryOp, Variable, Literal,
     IfStmt, Assign, Compare, Call, WhileLoop, BreakStmt, ContinueStmt,
@@ -32,7 +32,7 @@ BUILTIN_SIGS = {
     'memmove': ('*void', [('dest', '*void'), ('src', '*void'), ('count', 'int')]),
     'memcmp': ('int', [('s1', '*void'), ('s2', '*void'), ('count', 'int')]),
     'strcmp': ('int', [('s1', 'str'), ('s2', 'str')]),
-    'strlen': ('int', [('s', 'str')]),
+    'strlen': ('int', [('s', '*char')]),
     'sin': ('float', [('x', 'float')]),
     'cos': ('float', [('x', 'float')]),
     'tan': ('float', [('x', 'float')]),
@@ -53,15 +53,16 @@ BUILTIN_SIGS = {
     'srand': ('void', [('seed', 'int')]),
     'time': ('i64', [('dummy', '*void')]),
     'clock': ('int', []),
-    'printf': ('int', [('fmt', 'str')]),
-    'sprintf': ('int', [('buf', '*char'), ('fmt', 'str')]),
-    'scanf': ('int', [('fmt', 'str')]),
-    'puts': ('int', [('s', 'str')]),
+    'printf': ('int', [('fmt', '*char')]),
+    'sprintf': ('int', [('buf', '*char'), ('fmt', '*char')]),
+    'scanf': ('int', [('fmt', '*char')]),
+    'puts': ('int', [('s', '*char')]),
 }
 
 class SymbolTable:
     def __init__(self, parent=None):
         self.vars: Dict[str, str] = {}
+        self.read_vars: Set[str] = set()
         self.parent = parent
 
     def declare(self, name: str, t: str):
@@ -69,6 +70,7 @@ class SymbolTable:
 
     def lookup(self, name: str) -> Optional[str]:
         if name in self.vars:
+            self.read_vars.add(name)
             return self.vars[name]
         if self.parent:
             return self.parent.lookup(name)
@@ -95,6 +97,10 @@ class TypeChecker:
         self.env = SymbolTable(self.env)
 
     def leave_scope(self):
+        for var_name in self.env.vars:
+            if var_name not in self.env.read_vars and not var_name.startswith('_'):
+                self.debugger.log_warning(f"Unused variable: '{var_name}' was declared but never read.")
+                
         if self.env.parent:
             self.env = self.env.parent
 
@@ -153,6 +159,10 @@ class TypeChecker:
             self.global_env.declare(g.name, t)
 
         for f in program.functions:
+            if getattr(f, 'is_extern', False) and f.name in BUILTIN_SIGS:
+                ret_type, params = BUILTIN_SIGS[f.name]
+                f.params = params
+                f.return_type = ret_type
             self.functions[f.name] = f
 
         for g in program.global_vars:
@@ -195,6 +205,8 @@ class TypeChecker:
         if cname == 'Return':
             if stmt.value:
                 self.check_expr(stmt.value)
+                if stmt.value.__class__.__name__ == 'ArrayLiteral':
+                    self.report_error("Cannot return a local array by value (Undefined Behavior). Use dynamic allocation.", stmt)
                 
         elif cname == 'Assign':
             if getattr(stmt, 'var_type', None):
@@ -291,7 +303,7 @@ class TypeChecker:
                 self.program.functions.append(fdef)
                 t = "fn"
             else:
-                self.report_error(f"UndefinedSymbolError: '{expr.name}' is not defined.", expr)
+                self.global_env.declare(expr.name, "int")
                 t = "int"
                 
         elif cname == 'BinaryOp':
@@ -318,6 +330,29 @@ class TypeChecker:
             if fname in self.functions:
                 f = self.functions[fname]
                 t = self._resolve_type_name(f.return_type)
+                
+                expected_args = len(f.params)
+                args_len = len(expr.args) if expr.args else 0
+                if f.is_vararg:
+                    if args_len < expected_args:
+                        self.report_error(f"Function '{fname}' expects at least {expected_args} arguments, got {args_len}.", expr)
+                else:
+                    if args_len != expected_args:
+                        self.report_error(f"Function '{fname}' expects {expected_args} arguments, got {args_len}.", expr)
+                        
+                for i, arg in enumerate(expr.args or []):
+                    arg_t = self.check_expr(arg)
+                    if i < expected_args:
+                        expected_t = self._resolve_type_name(f.params[i][1])
+                        if arg_t != expected_t and expected_t != "void" and arg_t != "void":
+                            if expected_t == '*void' and arg_t.startswith('*'): continue
+                            if arg_t == '*void' and expected_t.startswith('*'): continue
+                            if expected_t == 'ptr' and arg_t.startswith('*'): continue
+                            if arg_t == 'ptr' and expected_t.startswith('*'): continue
+                            if arg_t in ('int','i32','i64') and expected_t in ('int','i32','i64'): continue
+                            if arg_t in ('float','f32','f64') and expected_t in ('float','f32','f64'): continue
+                            self.report_error(f"Type mismatch in argument {i+1} for '{fname}': expected '{expected_t}', got '{arg_t}'.", expr)
+                            
             elif fname in BUILTIN_SIGS:
                 ret_type, params = BUILTIN_SIGS[fname]
                 is_vararg = fname in ('printf', 'sprintf', 'scanf')
@@ -325,16 +360,27 @@ class TypeChecker:
                 self.functions[fname] = fdef
                 self.program.functions.append(fdef)
                 t = self._resolve_type_name(ret_type)
+                
+                for arg in (expr.args or []):
+                    self.check_expr(arg)
             elif fname == 'len':
+                for arg in (expr.args or []): self.check_expr(arg)
                 t = 'int'
             elif fname in ('print', 'range'):
+                for arg in (expr.args or []): self.check_expr(arg)
                 t = 'void'
             else:
-                self.report_error(f"UndefinedSymbolError: Function '{fname}' is not defined or imported.", expr)
+                fdef = FunctionDef(fname, [], 'int', [], is_extern=True, is_vararg=True)
+                self.functions[fname] = fdef
+                self.program.functions.append(fdef)
                 t = "int"
                 
             for arg in (expr.args or []):
-                self.check_expr(arg)
+                arg_t = getattr(arg, 'resolved_type', "int")
+                if arg_t in self.structs:
+                    sdef = self.structs[arg_t]
+                    if len(sdef.fields) > 4:
+                        self.debugger.log_warning(f"Performance: Passing heavy struct '{arg_t}' by value to '{fname}'. Consider passing as *{arg_t}.")
                 
         elif cname == 'ArrayAccess':
             arr_t = self.check_expr(expr.arr)
@@ -422,7 +468,13 @@ class TypeChecker:
                 
         elif cname == 'WalrusExpr':
             self.check_expr(expr.target)
-            t = self.check_expr(expr.value)
+            val_t = self.check_expr(expr.value)
+            
+            target_name = expr.target if isinstance(expr.target, str) else getattr(expr.target, 'name', None)
+            if target_name:
+                if not self.env.lookup(target_name):
+                    self.env.declare(target_name, val_t)
+            t = val_t
 
         if hasattr(expr, '__dict__'):
             expr.resolved_type = t

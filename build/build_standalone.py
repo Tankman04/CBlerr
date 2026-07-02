@@ -8,17 +8,10 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from collections import deque
+import math
 
-# THEY ESCAPING JOHNY, CATCH THEM                                   
 ESCAPE_TRANS = str.maketrans({
-    '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t'   
-
-    #                       \O_
-    #     I'M COMING     ,/\/
-    #                      /
-    #                      \
-    #                      `
-
+    '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t'
 })
 
 def is_gui_app_code(source_code: str) -> bool:
@@ -31,25 +24,31 @@ def is_packable_code(source_code: str) -> bool:
         return False
     return True
 
-def fold_constants(node: Any) -> Any:
+def fold_constants(node: Any, debugger: Any = None) -> Any:
     if isinstance(node, (list, tuple)):
         if isinstance(node, list):
             for i in range(len(node)):
-                node[i] = fold_constants(node[i])
+                node[i] = fold_constants(node[i], debugger)
         elif isinstance(node, tuple):
-            node = tuple(fold_constants(x) for x in node)
+            node = tuple(fold_constants(x, debugger) for x in node)
 
     if not hasattr(node, '__dict__'):
         return node
 
     for k, v in vars(node).items():
         if isinstance(v, (list, tuple)) or hasattr(v, '__dict__'):
-            setattr(node, k, fold_constants(v))
+            setattr(node, k, fold_constants(v, debugger))
 
     try:
-        from core.flux_ast import BinaryOp, Literal, Call, ArrayLiteral
-        
+        from core.flux_ast import BinaryOp, Literal, Call, ArrayLiteral, IfStmt
         cname = node.__class__.__name__
+        
+        if cname == 'IfStmt' and isinstance(node.condition, Literal):
+            if node.condition.value in (0, False, 0.0):
+                node.then_body = []
+            else:
+                node.else_body = []
+                
         if cname == 'Call':
             fname = node.func_name if isinstance(node.func_name, str) else getattr(node.func_name, 'name', None)
             if fname == 'len' and node.args and len(node.args) == 1:
@@ -58,6 +57,26 @@ def fold_constants(node: Any) -> Any:
                     return Literal(len(arg.value), 'int') 
                 elif isinstance(arg, ArrayLiteral):
                     return Literal(len(arg.elements), 'int')
+            
+            if fname in ('sin', 'cos', 'tan', 'sqrt', 'ceil', 'floor', 'abs', 'fabs', 'exp', 'log') and node.args and len(node.args) == 1:
+                arg = node.args[0]
+                if isinstance(arg, Literal) and arg.type in ('int', 'float', 'f32', 'f64', 'i32', 'i64'):
+                    try:
+                        val = float(arg.value)
+                        res = None
+                        if fname == 'sin': res = math.sin(val)
+                        elif fname == 'cos': res = math.cos(val)
+                        elif fname == 'tan': res = math.tan(val)
+                        elif fname == 'sqrt': res = math.sqrt(val)
+                        elif fname == 'ceil': res = math.ceil(val)
+                        elif fname == 'floor': res = math.floor(val)
+                        elif fname in ('abs', 'fabs'): res = abs(val)
+                        elif fname == 'exp': res = math.exp(val)
+                        elif fname == 'log' and val > 0: res = math.log(val)
+                        
+                        if res is not None:
+                            return Literal(res, 'float')
+                    except Exception: pass
 
         if cname == 'BinaryOp':
             if isinstance(node.left, Literal) and isinstance(node.right, Literal):
@@ -71,11 +90,18 @@ def fold_constants(node: Any) -> Any:
                         elif op == '-': res = l_val - r_val
                         elif op == '*': res = l_val * r_val
                         elif op == '/': 
+                            if r_val == 0:
+                                if debugger: debugger.log_error(f"Constant folding error: Division by zero")
+                                return node
                             if isinstance(l_val, int) and isinstance(r_val, int):
                                 res = l_val // r_val
                             else:
                                 res = l_val / r_val
-                        elif op == '%': res = l_val % r_val
+                        elif op == '%': 
+                            if r_val == 0:
+                                if debugger: debugger.log_error(f"Constant folding error: Modulo by zero")
+                                return node
+                            res = l_val % r_val
                         elif op == '**': res = l_val ** r_val
                         elif op == '&' and isinstance(l_val, int) and isinstance(r_val, int): res = l_val & r_val
                         elif op == '|' and isinstance(l_val, int) and isinstance(r_val, int): res = l_val | r_val
@@ -91,7 +117,10 @@ def fold_constants(node: Any) -> Any:
     except: pass
     return node
 
-def run_dce(ast: Any) -> Any:
+def run_dce(ast: Any, is_lib: bool = False) -> Any:
+    if is_lib:
+        return ast
+        
     if not hasattr(ast, 'functions') or not hasattr(ast, 'global_vars'):
         return ast
         
@@ -205,12 +234,10 @@ from core.debugger import init_debugger, get_debugger, DebugLevel
 class StaticMemoryAnalyzer:
     def __init__(self, debugger):
         self.debugger = debugger
-        self.warnings = []
 
     def report(self, msg, node):
         line = getattr(node, 'line', '?')
-        self.warnings.append(f"Line {line}: {msg}")
-        self.debugger.log_warning(f"Memory Safety: {msg} (Line {line})")
+        self.debugger.log_warning(f"Memory Analyzer: {msg} (Line {line})")
 
     def analyze(self, ast):
         if not hasattr(ast, 'functions'): return ast
@@ -221,6 +248,14 @@ class StaticMemoryAnalyzer:
 
     def analyze_func(self, func):
         states = {} 
+        aliases = {}
+
+        def get_root_alias(name):
+            seen = set()
+            while name in aliases and name not in seen:
+                seen.add(name)
+                name = aliases[name]
+            return name
 
         def get_target_name(expr):
             if isinstance(expr, str): return expr
@@ -228,8 +263,8 @@ class StaticMemoryAnalyzer:
             cname = expr.__class__.__name__
             if cname == 'Variable': return expr.name
             if cname == 'FieldAccess':
-                obj_name = get_target_name(expr.obj)
-                return f"{obj_name}.{expr.field}" if obj_name else None
+                obj = get_target_name(expr.obj)
+                return f"{obj}.{expr.field}" if obj else None
             return None
 
         def visit_expr(expr):
@@ -238,24 +273,39 @@ class StaticMemoryAnalyzer:
             cname = expr.__class__.__name__
             
             if cname == 'Variable':
-                if states.get(expr.name) == 'FREED':
-                    self.report(f"Use-After-Free: Variable '{expr.name}' is used after being freed.", expr)
-            elif cname == 'FieldAccess':
-                name = get_target_name(expr)
-                if name and states.get(name) == 'FREED':
-                    self.report(f"Use-After-Free: Field '{name}' is used after being freed.", expr)
-                visit_expr(expr.obj)
+                root = get_root_alias(expr.name)
+                if states.get(root) == 'FREED':
+                    self.report(f"Use-After-Free: Variable '{expr.name}' used after being freed.", expr)
+            
+            elif cname in ('FieldAccess', 'Dereference'):
+                base_name = get_target_name(expr.obj if cname == 'FieldAccess' else expr.ptr)
+                if base_name:
+                    root = get_root_alias(base_name)
+                    if states.get(root) == 'NULL':
+                        self.report(f"NPE (Null Pointer Exception): Attempt to dereference '{base_name}' which is NULL.", expr)
+                    elif states.get(root) == 'FREED':
+                        self.report(f"Use-After-Free: Dereferencing freed pointer '{base_name}'.", expr)
+                if cname == 'FieldAccess': visit_expr(expr.obj)
+                else: visit_expr(expr.ptr)
+
             elif cname == 'Call':
                 fname = expr.func_name if isinstance(expr.func_name, str) else getattr(expr.func_name, 'name', '')
                 if fname == 'free' and expr.args:
                     arg_name = get_target_name(expr.args[0])
                     if arg_name:
-                        state = states.get(arg_name)
-                        if state == 'FREED':
+                        root = get_root_alias(arg_name)
+                        state = states.get(root)
+                        if state == 'BUMPED':
+                            self.report(f"Arena Corruption: Calling free() on pointer '{arg_name}' allocated by bump()! Bump memory cannot be freed individually.", expr)
+                        elif state == 'FREED':
                             self.report(f"Double Free: Pointer '{arg_name}' is already freed.", expr)
-                        states[arg_name] = 'FREED'
+                        states[root] = 'FREED'
+                        for k in list(states.keys()):
+                            if get_root_alias(k) == root:
+                                states[k] = 'FREED'
                 else:
                     for arg in (expr.args or []): visit_expr(arg)
+
             elif cname in ('BinaryOp', 'Compare', 'LogicalOp', 'Assign', 'WalrusExpr'):
                 if hasattr(expr, 'left'): visit_expr(expr.left)
                 if hasattr(expr, 'right'): visit_expr(expr.right)
@@ -264,10 +314,8 @@ class StaticMemoryAnalyzer:
             elif cname == 'ArrayAccess':
                 visit_expr(expr.arr)
                 visit_expr(expr.index)
-            elif cname in ('Dereference', 'AddressOf', 'SizeOf', 'CastExpr'):
-                if hasattr(expr, 'ptr'): visit_expr(expr.ptr)
+            elif cname in ('AddressOf', 'SizeOf', 'CastExpr'):
                 if hasattr(expr, 'expr'): visit_expr(expr.expr)
-                if hasattr(expr, 'target') and cname != 'SizeOf': visit_expr(expr.target)
 
         def visit_stmt(stmt):
             if not stmt: return
@@ -275,27 +323,36 @@ class StaticMemoryAnalyzer:
             
             if cname == 'Assign':
                 t_name = get_target_name(stmt.target)
-                is_malloc = False
-                if stmt.value and stmt.value.__class__.__name__ == 'Call':
-                    fname = stmt.value.func_name if isinstance(stmt.value.func_name, str) else getattr(stmt.value.func_name, 'name', '')
-                    if fname == 'malloc':
-                        is_malloc = True
+                val_cname = stmt.value.__class__.__name__ if stmt.value else None
                 
-                if is_malloc and t_name:
-                    if states.get(t_name) == 'ALLOCATED':
-                        self.report(f"Memory Leak: '{t_name}' is reassigned to a new malloc before the previous allocation was freed.", stmt)
-                    states[t_name] = 'ALLOCATED'
-                else:
-                    visit_expr(stmt.value)
+                if t_name:
+                    root = get_root_alias(t_name)
+                    if val_cname == 'Literal' and stmt.value.value == 0:
+                        states[root] = 'NULL'
+                    elif val_cname == 'CastExpr' and stmt.value.expr.__class__.__name__ == 'Literal' and stmt.value.expr.value == 0:
+                        states[root] = 'NULL'
+                    elif val_cname == 'Call':
+                        fname = stmt.value.func_name if isinstance(stmt.value.func_name, str) else getattr(stmt.value.func_name, 'name', '')
+                        if fname == 'malloc':
+                            if states.get(root) == 'ALLOCATED':
+                                self.report(f"Memory Leak: '{t_name}' reassigned to a new malloc without freeing.", stmt)
+                            states[root] = 'ALLOCATED'
+                        elif fname == 'bump':
+                            states[root] = 'BUMPED'
+                    elif val_cname == 'Variable':
+                        aliases[t_name] = stmt.value.name
+                        
+                visit_expr(stmt.value)
                     
-            elif cname == 'Call':
-                visit_expr(stmt)
+            elif cname == 'Call': visit_expr(stmt)
             elif cname == 'Return':
                 visit_expr(stmt.value)
-                ret_name = get_target_name(stmt.value)
+                ret_name = get_root_alias(get_target_name(stmt.value)) if stmt.value else None
+                ret_aliases = {k for k in states if get_root_alias(k) == ret_name}
+                ret_aliases.add(ret_name)
                 for var, state in states.items():
-                    if state == 'ALLOCATED' and var != ret_name:
-                        self.report(f"Memory Leak: '{var}' is allocated but not freed before return.", stmt)
+                    if state == 'ALLOCATED' and var not in ret_aliases:
+                        self.report(f"Memory Leak: '{var}' is malloc'd but not freed before return.", stmt)
             elif cname == 'IfStmt':
                 visit_expr(stmt.condition)
                 for s in (stmt.then_body or []): visit_stmt(s)
@@ -315,13 +372,6 @@ class StaticMemoryAnalyzer:
         if func.body:
             for stmt in func.body:
                 visit_stmt(stmt)
-                
-        last_stmt = func.body[-1] if func.body else None
-        ret_name = get_target_name(last_stmt.value) if (last_stmt and last_stmt.__class__.__name__ == 'Return') else None
-        for var, state in states.items():
-            if state == 'ALLOCATED' and var != ret_name:
-                if last_stmt and last_stmt.__class__.__name__ != 'Return':
-                    self.report(f"Memory Leak: '{var}' is allocated but never freed in function '{func.name}'.", func)
 
 class CBLCodeEmitter:
     def __init__(self, target: str = "windows", module_name: str = "cblerr_module", source_filename: str = "", link_mode: Optional[str] = None, is_gui_app: bool = False):
@@ -412,19 +462,6 @@ class CBLCodeEmitter:
                             self.used_externs.add('GetStdHandle')
                         return
                     
-                    if len(node.args) == 1:
-                        arg = node.args[0]
-                        if arg.__class__.__name__ == 'Literal' and getattr(arg, 'type', '') == 'str':
-                            fast_val = arg.value + ("" if self.target == 'wasm' else "\n")
-                            if fast_val not in self.string_pool:
-                                self.string_pool[fast_val] = f"__str_const_{len(self.string_pool)}"
-                            setattr(node, '_is_fast_print', fast_val)
-                            self.used_externs.add('Cblerr_print_fast')
-                            if self.target == 'windows':
-                                self.used_externs.add('WriteConsoleA')
-                                self.used_externs.add('GetStdHandle')
-                            return
-                            
                     self.used_externs.add('Cblerr_print_string')
                     if self.target == 'windows':
                         self.used_externs.add('WriteConsoleA')
@@ -896,19 +933,23 @@ class CBLCodeEmitter:
             if 'pow' in used_math and "pow" not in user_impls:
                 self.emit_line("static inline double cbl_pow(double x, double y) { return __builtin_pow(x, y); }")
 
-            if ('sin' in used_math or 'cos' in used_math or 'tan' in used_math) and "sin" not in user_impls:
+            if 'sin' in used_math and "sin" not in user_impls:
                 self.emit_line("static inline double cbl_sin(double x) {")
-                self.emit_line("    double z = x * 0.3183098861837907;")
-                self.emit_line("    double k = (double)((int64_t)(z + (z >= 0.0 ? 0.5 : -0.5)));")
-                self.emit_line("    double dx = x - k * 3.141592653589793;")
-                self.emit_line("    double x2 = dx * dx;")
-                self.emit_line("    double poly = dx * (1.0 + x2 * (-0.16666666666666666 + x2 * (0.008333333333333333 + x2 * (-0.0001984126984126984 + x2 * 2.755731922398589e-6))));")
-                self.emit_line("    double is_odd = (double)(((int64_t)k) % 2 != 0 ? 1.0 : 0.0);")
-                self.emit_line("    return poly * (1.0 - 2.0 * is_odd);")
+                self.emit_line("    double rx = __builtin_fmod(x, 6.283185307179586);")
+                self.emit_line("    if (rx > 3.141592653589793) rx -= 6.283185307179586;")
+                self.emit_line("    else if (rx < -3.141592653589793) rx += 6.283185307179586;")
+                self.emit_line("    double x2 = rx * rx;")
+                self.emit_line("    return rx * (1.0 + x2 * (-0.16666666666666666 + x2 * (0.008333333333333333 + x2 * (-0.0001984126984126984 + x2 * (0.000002755731922398589 + x2 * (-0.00000002505210838544172 + x2 * 0.0000000001605904383682161))))));")
                 self.emit_line("}")
                 
             if 'cos' in used_math and "cos" not in user_impls:
-                self.emit_line("static inline double cbl_cos(double x) { return cbl_sin(x + 1.5707963267948966); }")
+                self.emit_line("static inline double cbl_cos(double x) {")
+                self.emit_line("    double rx = __builtin_fmod(x, 6.283185307179586);")
+                self.emit_line("    if (rx > 3.141592653589793) rx -= 6.283185307179586;")
+                self.emit_line("    else if (rx < -3.141592653589793) rx += 6.283185307179586;")
+                self.emit_line("    double x2 = rx * rx;")
+                self.emit_line("    return 1.0 + x2 * (-0.5 + x2 * (0.041666666666666664 + x2 * (-0.001388888888888889 + x2 * (0.0000248015873015873 + x2 * (-0.0000002755731922398589 + x2 * (0.0000000020876756987868 - x2 * 0.0000000000114707455977))))));")
+                self.emit_line("}")
                 
             if 'tan' in used_math and "tan" not in user_impls:
                 self.emit_line("static inline double cbl_tan(double x) {")
@@ -964,7 +1005,9 @@ class CBLCodeEmitter:
 
             if 'log' in used_math and "log" not in user_impls:
                 self.emit_line("static inline double cbl_log(double x) {")
-                self.emit_line("    double term = (x - 1.0) / (x + 1.0 + 1e-16);")
+                self.emit_line("    if (x < 0.0) return 0.0 / 0.0;")
+                self.emit_line("    if (x == 0.0) return -1.0 / 0.0;")
+                self.emit_line("    double term = (x - 1.0) / (x + 1.0);")
                 self.emit_line("    double t2 = term * term;")
                 self.emit_line("    double poly = 0.07692307692307693;")
                 self.emit_line("    poly = 0.09090909090909091 + t2 * poly;")
@@ -973,8 +1016,7 @@ class CBLCodeEmitter:
                 self.emit_line("    poly = 0.20000000000000000 + t2 * poly;")
                 self.emit_line("    poly = 0.33333333333333330 + t2 * poly;")
                 self.emit_line("    poly = 1.00000000000000000 + t2 * poly;")
-                self.emit_line("    double m = (x <= 0.0);")
-                self.emit_line("    return (1.0 - m) * (2.0 * term * poly);")
+                self.emit_line("    return 2.0 * term * poly;")
                 self.emit_line("}")
             self.emit_line()
 
@@ -1048,6 +1090,7 @@ class CBLCodeEmitter:
                 self.emit_line("static inline bool flux_string_eq(string a, string b) {")
                 self.emit_line("    if (a.length != b.length) return false;")
                 self.emit_line("    if (!a.length) return true;")
+                self.emit_line("    if (!a.data || !b.data) return false;")
                 self.emit_line("    return cbl_memcmp(a.data, b.data, a.length) == 0;")
                 self.emit_line("}") 
         self.emit_line()
@@ -1140,14 +1183,36 @@ class CBLCodeEmitter:
     def _get_c_declaration(self, flux_type, name: str) -> str:
         if not isinstance(flux_type, str) or not flux_type.startswith('*fn('): 
             return f"{self._get_c_type(flux_type)} {name}"
-        start, pos, depth = flux_type.find('('), flux_type.find('(') + 1, 1
-        while pos < len(flux_type) and depth > 0:
+            
+        depth = 0
+        start = flux_type.find('(')
+        pos = start + 1
+        while pos < len(flux_type):
             if flux_type[pos] == '(': depth += 1
-            elif flux_type[pos] == ')': depth -= 1
+            elif flux_type[pos] == ')':
+                if depth == 0: break
+                depth -= 1
             pos += 1
-        params_sec, rest = flux_type[start+1:pos-1].strip(), flux_type[pos:].strip()
-        ret = rest[2:] if rest.startswith('->') else 'void'
-        params = [p.strip() for p in params_sec.split(',')] if params_sec else []
+            
+        params_sec = flux_type[start+1:pos].strip()
+        rest = flux_type[pos+1:].strip()
+        ret = rest[2:].strip() if rest.startswith('->') else 'void'
+        
+        params = []
+        if params_sec:
+            current = []
+            p_depth = 0
+            for char in params_sec:
+                if char == '(': p_depth += 1
+                elif char == ')': p_depth -= 1
+                elif char == ',' and p_depth == 0:
+                    params.append(''.join(current).strip())
+                    current = []
+                    continue
+                current.append(char)
+            if current:
+                params.append(''.join(current).strip())
+                
         param_cs = [self._get_c_type(p) for p in params] if params else ['void']
         return f"{self._get_c_type(ret)} (*{name})({', '.join(param_cs)})"
 
@@ -1220,13 +1285,17 @@ class CBLCodeEmitter:
                         params.append(f"{self._get_c_type(ptype)} {pname}")
         params_str = ", ".join(params) if params else "void"
         
+        if getattr(func_def, 'is_vararg', False):
+            if params_str == "void": params_str = "..."
+            else: params_str += ", ..."
+        
         call_conv = " __stdcall" if getattr(func_def, 'is_extern', False) and self.target == 'windows' and (func_def.name.endswith('A') or func_def.name.endswith('W') or func_def.name in self.win_critical_externs) else ""
         return f"{return_type}{call_conv} {func_def.name}({params_str})"
 
     def _emit_unwind_defers(self, target_depth: int):
         for scope in reversed(self.defer_scopes[target_depth:]):
             for d in reversed(scope):
-                self.emit_line("{ // defer like from zig or ahh, go? idk")
+                self.emit_line("{")
                 self.indent_level += 1
                 for s in d.body:
                     self._generate_statement(s)
@@ -1511,8 +1580,19 @@ class CBLCodeEmitter:
                     pool_name = self.string_pool.get(fast_val, '((string){(char*)"",0})')
                     return f"Cblerr_print_fast({pool_name})"
                 
-                arg = expr.args[0]
-                return f"Cblerr_print_string({self._generate_expression(arg)})"
+                if not getattr(expr, 'args', None):
+                    return "0"
+                    
+                prints = []
+                for arg in expr.args:
+                    arg_code = self._generate_expression(arg)
+                    prints.append(f"Cblerr_print_string({arg_code})")
+                    
+                if prints:
+                    if len(prints) == 1:
+                        return prints[0]
+                    return "(" + ", ".join(prints) + ", 0)"
+                return "0"
             
             if fname == 'len':
                 if not expr.args: return '0'
@@ -1842,7 +1922,7 @@ class StandaloneCompiler:
             target_str = f"{self.target.upper()} (DLL: {self.is_dll}, 32-bit: {self.m32})"
             self.log(f"CBlerr Console Compiler (CCC)\nTarget OS: {target_str}\nOutput: {self.output_exe}")
             
-            self.log("\n[1/8] Reading code...")
+            self.log("\n[1/9] Reading code...")
             if not self.source_file.exists():
                 self.log(f"Uh oh, couldn't find the file: {self.source_file}", "ERROR")
                 return False
@@ -1883,13 +1963,13 @@ class StandaloneCompiler:
             t_read = time.perf_counter()
             perf_times['Read Source'] = t_read - t_start
 
-            self.log("\n[2/8] Tokenizing...")
+            self.log("\n[2/9] Tokenizing...")
             tokens = tokenize(self.source_code, str(self.source_file))
 
             t_tok = time.perf_counter()
             perf_times['Lexer'] = t_tok - t_read
 
-            self.log("\n[3/8] Parsing code...")
+            self.log("\n[3/9] Parsing code...")
             ast = parse(tokens)
 
             try:
@@ -1902,14 +1982,25 @@ class StandaloneCompiler:
             t_parse = time.perf_counter()
             perf_times['Parser & Imports'] = t_parse - t_tok
 
-            self.log("\n[4/8] AST Optimization (Const Fold & DCE)...")
-            ast = fold_constants(ast)
-            ast = run_dce(ast)
+            self.log("\n[4/9] Monomorphization...")
+            try:
+                from core.monomorphizer import monomorphize
+                ast = monomorphize(ast)
+            except Exception as e:
+                self.log(f'Monomorphization error: {e}', "ERROR")
+                return False
+
+            t_mono = time.perf_counter()
+            perf_times['Monomorphization'] = t_mono - t_parse
+
+            self.log("\n[5/9] AST Optimization (Const Fold & DCE)...")
+            ast = fold_constants(ast, debugger)
+            ast = run_dce(ast, is_lib=(self.is_dll or self.target == 'wasm'))
 
             t_opt = time.perf_counter()
-            perf_times['Optimizer'] = t_opt - t_parse
+            perf_times['Optimizer'] = t_opt - t_mono
 
-            self.log("\n[5/8] Type Checking...")
+            self.log("\n[6/9] Type Checking & Dead Variables Analysis...")
             try:
                 ast = type_check(ast)
             except TypeCheckError as e:
@@ -1925,14 +2016,14 @@ class StandaloneCompiler:
             t_type = time.perf_counter()
             perf_times['Type Checker'] = t_type - t_opt
 
-            self.log("\n[6/8] Static Memory Analysis...")
+            self.log("\n[7/9] Static Memory Analysis...")
             mem_analyzer = StaticMemoryAnalyzer(debugger)
             ast = mem_analyzer.analyze(ast)
 
             t_mem = time.perf_counter()
             perf_times['Memory Analyzer'] = t_mem - t_type
 
-            self.log("\n[7/8] Generating C code...")
+            self.log("\n[8/9] Generating C code...")
             generator = CBLCodeEmitter(
                 target="winlib" if self.is_dll else self.target,
                 module_name=self.source_file.stem,
@@ -1968,9 +2059,9 @@ class StandaloneCompiler:
             perf_times['Code Generation'] = t_gen - t_mem
 
             if self.asm_out:
-                self.log("\n[8/8] Compiling C code to Assembly...")
+                self.log("\n[9/9] Compiling C code to Assembly...")
             else:
-                self.log("\n[8/8] Compiling C code to executable...")
+                self.log("\n[9/9] Compiling C code to executable...")
                 
             self.res_file = self._compile_resources()
             self._prepare_output_file()

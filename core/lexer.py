@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Tuple
@@ -357,8 +356,11 @@ class Lexer:
                     continue
                 indent_level = 0
                 temp_pos = self.pos
-                while temp_pos < src_len and self.source[temp_pos] == ' ':
-                    indent_level += 1
+                while temp_pos < src_len and self.source[temp_pos] in ' \t':
+                    if self.source[temp_pos] == '\t':
+                        indent_level += 4
+                    else:
+                        indent_level += 1
                     temp_pos += 1
                 if temp_pos >= src_len or self.source[temp_pos] in '\n#':
                     while self.pos < src_len and self.source[self.pos] != '\n':

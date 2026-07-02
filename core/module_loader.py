@@ -70,8 +70,8 @@ def inline_imports(program: Program, source_path: str | Path, cache: Dict[Path, 
             exports = {f.name for f in imported_prog.functions} | \
                       {s.name for s in imported_prog.structs} | \
                       {g.name for g in imported_prog.global_vars}
-            
-            prefix = re.sub(r'[^a-zA-Z0-9_]', '_', module_name)
+    
+            prefix = re.sub(r'[^a-zA-Z0-9_]', '_', mod_path.stem)
             
             def rename_type(t):
                 if isinstance(t, str):
@@ -159,21 +159,24 @@ def inline_imports(program: Program, source_path: str | Path, cache: Dict[Path, 
                 found = False
                 for f in imported_prog.functions:
                     if f.name == item:
-                        if item in funcs_names: raise ImportError(f"Duplicate symbol '{item}'")
+                        if item in funcs_names: 
+                            found = True; break
                         program.functions.append(f)
                         funcs_names.add(item)
                         found = True; break
                 if found: continue
                 for s in imported_prog.structs:
                     if s.name == item:
-                        if item in structs_names: raise ImportError(f"Duplicate symbol '{item}'")
+                        if item in structs_names: 
+                            found = True; break
                         program.structs.append(s)
                         structs_names.add(item)
                         found = True; break
                 if found: continue
                 for g in imported_prog.global_vars:
                     if g.name == item:
-                        if item in globals_names: raise ImportError(f"Duplicate symbol '{item}'")
+                        if item in globals_names: 
+                            found = True; break
                         program.global_vars.append(g)
                         globals_names.add(item)
                         found = True; break

@@ -33,11 +33,13 @@ def type_to_str(t: Any) -> str:
 def collect_placeholders_from_type(t: Any, acc: list[str]):
     if isinstance(t, str):
         base = t.replace('*', '')
-        if base and base[0].isupper() and base not in acc: acc.append(base)
+        if base and len(base) == 1 and base.isupper() and base not in acc: 
+            acc.append(base)
     else:
         cname = t.__class__.__name__
         if cname == 'GenericType':
-            if t.name and t.name[0].isupper() and t.name not in acc: acc.append(t.name)
+            if t.name and len(t.name) == 1 and t.name.isupper() and t.name not in acc: 
+                acc.append(t.name)
             for a in t.args: collect_placeholders_from_type(a, acc)
         elif cname == 'PointerType':
             collect_placeholders_from_type(t.base_type, acc)
