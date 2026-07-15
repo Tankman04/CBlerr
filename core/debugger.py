@@ -1,4 +1,3 @@
-
 import sys
 import os
 import inspect
@@ -539,7 +538,22 @@ class GameDebugger:
             hint = None
 
             if re.search(r'Unknown|Unexpected token|Unexpected', msg, flags=re.I):
-                reason = 'Invalid or unexpected code fragment'
+                reason = 'Invalid or unexpected code fragment. / Неизвестный или неожиданный токен.'
+            elif "Type mismatch" in msg:
+                reason = "Type mismatch! You're trying to mix incompatible types. / Ошибка типизации! Типы несовместимы."
+                fix = "Check the expected type and ensure you're passing the right one, or use a cast (e.g. 'as int')."
+            elif "UndefinedSymbolError" in msg or "not defined" in msg:
+                reason = "The compiler encountered an unknown variable, function, or field. / Компилятор не нашел это имя."
+                fix = "Check for typos or make sure you declared it before using it."
+            elif "InvalidTypeError" in msg:
+                reason = "You're trying to perform an invalid operation on this type. / Недопустимая операция для данного типа."
+                fix = "Make sure you're indexing an array or dereferencing a valid pointer."
+            elif "arguments" in msg and "expects" in msg:
+                reason = "Incorrect number of arguments passed to a function. / Неверное количество аргументов у функции."
+                fix = "Verify the function signature and provide the correct amount of arguments."
+            elif "Pointer arithmetic" in msg or "restricted" in msg:
+                reason = "Invalid pointer arithmetic. / Арифметика указателей запрещена."
+                fix = "You can't do this specific math operation directly on pointers. Cast to an integer first if you really need to."
 
             m_unknown = re.search(r"'([^']+)'", msg)
             if m_unknown:

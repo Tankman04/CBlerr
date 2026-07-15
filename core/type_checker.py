@@ -144,6 +144,23 @@ class TypeChecker:
             if is_ptr2 and not is_ptr1 and t1 not in valid_ints:
                 self.report_error(f"Cannot perform '{op}' on '{t1}' and pointer.", node)
 
+    def has_guaranteed_return(self, body: list) -> bool:
+        if not body: return False
+        for stmt in body:
+            cname = stmt.__class__.__name__
+            if cname == 'Return':
+                return True
+            elif cname == 'IfStmt':
+                if stmt.else_body is not None:
+                    if self.has_guaranteed_return(stmt.then_body) and self.has_guaranteed_return(stmt.else_body):
+                        return True
+            elif cname == 'MatchStmt':
+                has_default = any(c.values is None for c in stmt.cases)
+                all_return = all(self.has_guaranteed_return(c.body) for c in stmt.cases)
+                if has_default and all_return:
+                    return True
+        return False
+
     def check(self, program: Program) -> Program:
         self.program = program
         
@@ -190,6 +207,11 @@ class TypeChecker:
             if f.body:
                 for stmt in f.body:
                     self.check_stmt(stmt)
+                    
+                if f.return_type and f.return_type != 'void':
+                    ret_type_str = self._resolve_type_name(f.return_type)
+                    if ret_type_str != 'void' and not self.has_guaranteed_return(f.body):
+                        self.report_error(f"Function '{f.name}' promises to return '{ret_type_str}', but not all execution paths return a value.", f)
                 
             self.leave_scope()
             self.current_func = None

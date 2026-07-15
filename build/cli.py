@@ -70,7 +70,7 @@ def print_help():
     print("  \033[32m-run\033[0m        Run the compiled executable immediately after a successful build")
     print("  \033[32m-asm\033[0m        Generate assembly code instead of an executable")
     print("  \033[32m-o <file>\033[0m   Set the name of the output executable")
-    print("  \033[32m-t <os>\033[0m     Target OS: windows, linux, wasm, winlib (for DLLs)")
+    print("  \033[32m-t <os>\033[0m     Target OS: windows, linux, wasm, winlib (for DLLs), winsaver (for .scr screensavers)")
     print("  \033[32m-q, --quiet\033[0m Hide detailed compilation logs")
     print("  \033[32m-static\033[0m     Use static linking for libraries")
     print("  \033[32m-dynamic\033[0m    Use dynamic linking")
@@ -262,7 +262,7 @@ def main():
         sys.exit(1)
 
     if asm_out:
-        if output_exe.lower().endswith('.exe') or output_exe.lower().endswith('.dll') or output_exe.lower().endswith('.wasm'):
+        if output_exe.lower().endswith('.exe') or output_exe.lower().endswith('.dll') or output_exe.lower().endswith('.wasm') or output_exe.lower().endswith('.scr'):
             output_exe = output_exe.rsplit('.', 1)[0] + '.s'
         elif not output_exe.lower().endswith('.s') and not output_exe.lower().endswith('.asm'):
             output_exe += '.s'
@@ -271,6 +271,10 @@ def main():
             output_exe += '.exe'
         elif target == 'winlib' and not output_exe.lower().endswith('.dll'):
             output_exe += '.dll'
+        elif target in ('winsaver', 'screensaver'):
+            if not output_exe.lower().endswith('.scr'):
+                output_exe += '.scr'
+            target = 'winsaver'
         elif target == 'wasm' and not output_exe.lower().endswith('.wasm'):
             output_exe += '.wasm'
         

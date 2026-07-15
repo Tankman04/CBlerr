@@ -306,6 +306,18 @@ class Lexer:
                     elif nc == '\\': chars.append('\\')
                     elif nc == quote_char: chars.append(quote_char)
                     elif nc == '0': chars.append('\0')
+                    elif nc == 'x':
+                        self.advance()
+                        hex_str = self.source[self.pos:self.pos+2]
+                        if len(hex_str) == 2 and all(hc in '0123456789abcdefABCDEF' for hc in hex_str):
+                            chars.append(chr(int(hex_str, 16)))
+                            self.advance() 
+                            self.advance() 
+                            continue
+                        else:
+                            self._add_error("Invalid hex escape sequence")
+                            chars.append('x')
+                            continue
                     else: chars.append(nc)
                     self.advance()
             elif c == '\n':

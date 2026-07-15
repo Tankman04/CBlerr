@@ -10,10 +10,6 @@ from typing import List, Optional, Tuple, Dict, Any
 from collections import deque
 import math
 
-ESCAPE_TRANS = str.maketrans({
-    '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t'
-})
-
 def is_gui_app_code(source_code: str) -> bool:
     clean = re.sub(r'//.*|/\*.*?\*/|"(?:\\.|[^"\\])*"', '', source_code, flags=re.DOTALL).lower()
     gui_calls = ["winmain", "windowproc", "createwindow", "dispatchmessage", "setwindowcompositionattribute"]
@@ -377,10 +373,11 @@ class CBLCodeEmitter:
     def __init__(self, target: str = "windows", module_name: str = "cblerr_module", source_filename: str = "", link_mode: Optional[str] = None, is_gui_app: bool = False):
         target_lower = target.lower()
         self.is_dll = (target_lower == "winlib")
+        self.is_scr = (target_lower in ("winsaver", "screensaver"))
         if target_lower == "wasm":
             self.target = "wasm"
         else:
-            self.target = "windows" if self.is_dll else target_lower
+            self.target = "windows" if (self.is_dll or self.is_scr or target_lower == "windows") else target_lower
             
         self.module_name = module_name
         self.source_filename = source_filename
@@ -406,8 +403,26 @@ class CBLCodeEmitter:
         
         self.win_msvcrt_registry = {
             "printf": ("int", "(const char*, ...)"),
-            "sprintf": ("int", "(char*, const char*, ...)"), "puts": ("int", "(const char*)"),
-            "scanf": ("int", "(const char*, ...)")
+            "sprintf": ("int", "(char*, const char*, ...)"), 
+            "puts": ("int", "(const char*)"),
+            "scanf": ("int", "(const char*, ...)"),
+            
+            "_kbhit": ("int", "(void)"),
+            "_getch": ("int", "(void)"),
+            "kbhit": ("int", "(void)"),
+            "getch": ("int", "(void)"),
+            "getchar": ("int", "(void)"),
+            "putchar": ("int", "(int)"),
+            
+            "fopen": ("void*", "(const char*, const char*)"),
+            "fclose": ("int", "(void*)"),
+            "fread": ("size_t", "(void*, size_t, size_t, void*)"),
+            "fwrite": ("size_t", "(const void*, size_t, size_t, void*)"),
+            "fseek": ("int", "(void*, long, int)"),
+            "ftell": ("long", "(void*)"),
+            
+            "system": ("int", "(const char*)"),
+            "exit": ("void", "(int)")
         }
 
     def emit_line(self, line: str = ""):
@@ -417,7 +432,17 @@ class CBLCodeEmitter:
             self.code_lines.append("")
 
     def _escape_string(self, s: str) -> str:
-        return s.translate(ESCAPE_TRANS)
+        b = s.encode('utf-8')
+        res = []
+        for byte in b:
+            if byte == 92: res.append('\\\\')
+            elif byte == 34: res.append('\\"')
+            elif byte == 10: res.append('\\n')
+            elif byte == 13: res.append('\\r')
+            elif byte == 9: res.append('\\t')
+            elif 32 <= byte <= 126: res.append(chr(byte))
+            else: res.append(f"\\{byte:03o}")
+        return ''.join(res)
 
     def _get_local_c_type(self, var_name: str) -> Optional[str]:
         if self.local_vars_stack and var_name in self.local_vars_stack[-1]:
@@ -912,6 +937,9 @@ class CBLCodeEmitter:
         math_externs = {'sin', 'cos', 'tan', 'pow', 'sqrt', 'asin', 'acos', 'atan', 'atan2', 'log', 'exp', 'floor', 'ceil', 'fmod', 'abs', 'fabs'}
         used_math = [name for name in math_externs if name in self.used_externs]
         
+        if 'acos' in used_math and 'asin' not in used_math:
+            used_math.append('asin')
+        
         for f in used_math:
             self.emit_line(f"#define {f} cbl_{f}")
 
@@ -953,11 +981,11 @@ class CBLCodeEmitter:
                 
             if 'tan' in used_math and "tan" not in user_impls:
                 self.emit_line("static inline double cbl_tan(double x) {")
-                self.emit_line("    double z = x * 0.3183098861837907;")
-                self.emit_line("    double k = (double)((int64_t)(z + (z >= 0.0 ? 0.5 : -0.5)));")
-                self.emit_line("    double dx = x - k * 3.141592653589793;")
-                self.emit_line("    double x2 = dx * dx;")
-                self.emit_line("    double num = dx * (1.0 + x2 * (-0.11528658694082823 + x2 * 0.002241676648721473));")
+                self.emit_line("    double rx = __builtin_fmod(x, 3.141592653589793);")
+                self.emit_line("    if (rx > 1.5707963267948966) rx -= 3.141592653589793;")
+                self.emit_line("    else if (rx < -1.5707963267948966) rx += 3.141592653589793;")
+                self.emit_line("    double x2 = rx * rx;")
+                self.emit_line("    double num = rx * (1.0 + x2 * (-0.11528658694082823 + x2 * 0.002241676648721473));")
                 self.emit_line("    double den = 1.0 + x2 * (-0.4486199202741615 + x2 * (0.03964952093557997 - x2 * 0.0006275819717141527));")
                 self.emit_line("    return num / den;")
                 self.emit_line("}")
@@ -965,36 +993,47 @@ class CBLCodeEmitter:
             if 'atan' in used_math and "atan" not in user_impls:
                 self.emit_line("static inline double cbl_atan(double x) {")
                 self.emit_line("    double a = (x < 0.0 ? -x : x);")
-                self.emit_line("    double m1 = (a > 1.0);") 
-                self.emit_line("    double z = (1.0 - m1) * a + m1 * (1.0 / (a + 1e-16));")
-                self.emit_line("    double z2 = z * z;")
-                self.emit_line("    double p = z * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.19999999999999996 + z2 * (-0.14285714285714285 + z2 * 0.1111111111111111))));")
-                self.emit_line("    p = (1.0 - m1) * p + m1 * (1.5707963267948966 - p);")
-                self.emit_line("    double m2 = (x < 0.0);")
-                self.emit_line("    return p * (1.0 - 2.0 * m2);")
+                self.emit_line("    int invert = a > 1.0;")
+                self.emit_line("    if (invert) a = 1.0 / a;")
+                self.emit_line("    double z2 = a * a;")
+                self.emit_line("    double p;")
+                self.emit_line("    if (a > 0.41421356237309503) {")
+                self.emit_line("        double num = (a - 1.0) / (a + 1.0);")
+                self.emit_line("        double num2 = num * num;")
+                self.emit_line("        p = 0.7853981633974483 + num * (1.0 + num2 * (-0.3333333333333333 + num2 * (0.2 + num2 * (-0.14285714285714285 + num2 * (0.1111111111111111 + num2 * (-0.09090909090909091 + num2 * 0.07692307692307693))))));")
+                self.emit_line("    } else {")
+                self.emit_line("        p = a * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.2 + z2 * (-0.14285714285714285 + z2 * (0.1111111111111111 + z2 * (-0.09090909090909091 + z2 * 0.07692307692307693))))));")
+                self.emit_line("    }")
+                self.emit_line("    if (invert) p = 1.5707963267948966 - p;")
+                self.emit_line("    return x < 0.0 ? -p : p;")
                 self.emit_line("}")
 
             if 'atan2' in used_math and "atan2" not in user_impls:
                 self.emit_line("static inline double cbl_atan2(double y, double x) {")
-                self.emit_line("    double abs_y = (y < 0.0 ? -y : y) + 1e-16;")
+                self.emit_line("    if (y == 0.0 && x == 0.0) return 0.0;")
+                self.emit_line("    double abs_y = (y < 0.0 ? -y : y);")
                 self.emit_line("    double abs_x = (x < 0.0 ? -x : x);")
-                self.emit_line("    double m1 = (abs_y > abs_x);")
-                self.emit_line("    double num = (1.0 - m1) * abs_y + m1 * abs_x;")
-                self.emit_line("    double den = (1.0 - m1) * abs_x + m1 * abs_y;")
-                self.emit_line("    double z = num / den;")
-                self.emit_line("    double z2 = z * z;")
-                self.emit_line("    double p = z * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.19999999999999996 + z2 * (-0.14285714285714285 + z2 * 0.1111111111111111))));")
-                self.emit_line("    p = (1.0 - m1) * p + m1 * (1.5707963267948966 - p);")
-                self.emit_line("    double m2 = (x < 0.0);")
-                self.emit_line("    p = (1.0 - m2) * p + m2 * (3.141592653589793 - p);")
-                self.emit_line("    double m3 = (y < 0.0);")
-                self.emit_line("    return p * (1.0 - 2.0 * m3);")
+                self.emit_line("    int invert = abs_y > abs_x;")
+                self.emit_line("    double a = invert ? (abs_x / abs_y) : (abs_y / abs_x);")
+                self.emit_line("    double z2 = a * a;")
+                self.emit_line("    double p;")
+                self.emit_line("    if (a > 0.41421356237309503) {")
+                self.emit_line("        double num = (a - 1.0) / (a + 1.0);")
+                self.emit_line("        double num2 = num * num;")
+                self.emit_line("        p = 0.7853981633974483 + num * (1.0 + num2 * (-0.3333333333333333 + num2 * (0.2 + num2 * (-0.14285714285714285 + num2 * (0.1111111111111111 + num2 * (-0.09090909090909091 + num2 * 0.07692307692307693))))));")
+                self.emit_line("    } else {")
+                self.emit_line("        p = a * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.2 + z2 * (-0.14285714285714285 + z2 * (0.1111111111111111 + z2 * (-0.09090909090909091 + z2 * 0.07692307692307693))))));")
+                self.emit_line("    }")
+                self.emit_line("    if (invert) p = 1.5707963267948966 - p;")
+                self.emit_line("    if (x < 0.0) p = 3.141592653589793 - p;")
+                self.emit_line("    return y < 0.0 ? -p : p;")
                 self.emit_line("}")
 
             if 'asin' in used_math and "asin" not in user_impls:
                 self.emit_line("static inline double cbl_asin(double x) {")
                 self.emit_line("    double a = (x < 0.0 ? -x : x);")
-                self.emit_line("    double poly = 1.5707963050 + a * (-0.2145988016 + a * (0.0889789874 + a * (-0.0501743046 + a * (0.0308918810 + a * (-0.0170881256 + a * (0.0066700901 - a * 0.0012624911))))));")
+                self.emit_line("    if (a > 1.0) return 0.0 / 0.0;")
+                self.emit_line("    double poly = 1.5707963267948966 + a * (-0.2145988016 + a * (0.0889789874 + a * (-0.0501743046 + a * (0.0308918810 + a * (-0.0170881256 + a * (0.0066700901 - a * 0.0012624911))))));")
                 self.emit_line("    double res = 1.5707963267948966 - __builtin_sqrt(1.0 - a) * poly;")
                 self.emit_line("    double m2 = (x < 0.0);")
                 self.emit_line("    return res * (1.0 - 2.0 * m2);")
@@ -1669,10 +1708,11 @@ class StandaloneCompiler:
         
         target_lower = target.lower()
         self.is_dll = (target_lower == 'winlib')
+        self.is_scr = (target_lower in ('winsaver', 'screensaver'))
         if target_lower == 'wasm':
             self.target = 'wasm'
         else:
-            self.target = 'windows' if self.is_dll else target_lower
+            self.target = 'windows' if (self.is_dll or self.is_scr or target_lower == 'windows') else target_lower
         self.m32 = m32
         
         self.verbose = verbose
@@ -1792,7 +1832,7 @@ class StandaloneCompiler:
             '-Wno-discarded-qualifiers -Wno-implicit-function-declaration -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast'
         )
         
-        is_msvc = (compiler == 'clang' and self._is_msvc_clang())
+        is_msvc = (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows')
         if not is_msvc:
             flags += ' -s -fmerge-all-constants'
             if self.opt_level == '-Os':
@@ -1822,7 +1862,7 @@ class StandaloneCompiler:
     
     def _get_linker_flags(self, compiler: str = 'gcc') -> str:
         flags = ['-fno-lto']
-        is_msvc = (compiler == 'clang' and self._is_msvc_clang())
+        is_msvc = (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows')
         
         if self.m32 and self.target != 'wasm':
             flags.append('-m32')
@@ -1858,7 +1898,7 @@ class StandaloneCompiler:
                 
                 flags.append('-Wl,--gc-sections')
                 
-                if compiler == 'gcc':
+                if compiler in ('gcc', 'clang'):
                     flags.extend(['-Wl,--file-alignment=1', '-Wl,--section-alignment=1'])
                 
         elif self.target == 'linux':
@@ -1877,6 +1917,30 @@ class StandaloneCompiler:
                 flags.append(f'-Wl,--stack,{self.stack_reserve}')
                 
         return ' '.join(flags)
+
+    def _get_windows_libs(self, compiler: str) -> List[str]:
+        libs = ['kernel32', 'user32']
+        if compiler == 'gcc':
+            libs.append('ntdll')
+            
+        code = self.source_code.lower()
+        if 'opengl' in code or 'wgl' in code or 'glclear' in code or 'glbegin' in code or 'glflush' in code:
+            libs.append('opengl32')
+        if 'winmm' in code or 'mci' in code or 'playsound' in code or 'timegettime' in code or 'waveout' in code:
+            libs.append('winmm')
+        if 'gdi32' in code or 'bitblt' in code or 'createcompatible' in code or 'selectobject' in code or 'createdib' in code or 'stretchdibits' in code or 'setdibits' in code or 'deleteobject' in code or 'createfont' in code or 'choosepixelformat' in code or 'swapbuffers' in code:
+            libs.append('gdi32')
+        if 'advapi32' in code or 'regopen' in code or 'regcreate' in code or 'regset' in code or 'crypt' in code:
+            libs.append('advapi32')
+        if 'shell32' in code or 'shellexecute' in code or 'dragaccept' in code or 'shget' in code:
+            libs.append('shell32')
+        if 'ole32' in code or 'coinitialize' in code or 'cocreate' in code:
+            libs.append('ole32')
+            
+        if compiler == 'msvc' or (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows'):
+            return [lib + '.lib' for lib in libs]
+        else:
+            return ['-l' + lib for lib in libs]
 
     def _compile_resources(self) -> Optional[str]:
         if not self.is_windows or not self.icon_path:
@@ -1905,7 +1969,7 @@ class StandaloneCompiler:
         return None
 
     def _prepare_output_file(self):
-        for p in (self.output_exe, self.output_exe.with_suffix('.exe')):
+        for p in (self.output_exe, self.output_exe.with_suffix('.exe'), self.output_exe.with_suffix('.scr')):
             try:
                 if p.exists():
                     p.unlink()
@@ -1919,7 +1983,7 @@ class StandaloneCompiler:
         debugger = init_debugger(DebugLevel.INFO)
         self.debugger = debugger
         try:
-            target_str = f"{self.target.upper()} (DLL: {self.is_dll}, 32-bit: {self.m32})"
+            target_str = f"{self.target.upper()} (DLL: {self.is_dll}, SCR: {self.is_scr}, 32-bit: {self.m32})"
             self.log(f"CBlerr Console Compiler (CCC)\nTarget OS: {target_str}\nOutput: {self.output_exe}")
             
             self.log("\n[1/9] Reading code...")
@@ -1932,12 +1996,16 @@ class StandaloneCompiler:
                 self.is_gui_app = is_gui_app_code(self.source_code)
             self.packable = is_packable_code(self.source_code)
             
-            if self.is_gui_app and self.target == 'windows' and not self.is_dll:
+            if self.is_gui_app and self.target == 'windows' and not self.is_dll and not self.is_scr:
                 self.packable = False
                 self.log("  [+] Looks like a GUI application! (Packing disabled)")
             elif self.is_dll:
                 self.packable = False
                 self.log("  [+] Compiling as a DLL. (Packing disabled to keep it safe!)")
+            elif self.is_scr:
+                self.is_gui_app = True
+                self.packable = False
+                self.log("  [+] Compiling as a Windows Screensaver (.scr).")
             elif self.target == 'wasm':
                 self.packable = False
                 self.log("  [+] Targeting WebAssembly. (No PE packers needed)")
@@ -2006,7 +2074,18 @@ class StandaloneCompiler:
             except TypeCheckError as e:
                 self.log(f"\n[TYPE ERROR] Found {len(e.errors)} error(s):", "ERROR")
                 for err in e.errors:
-                    print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
+                    m = re.match(r"Line (\d+|\?): (.*)", err)
+                    if m and m.group(1) != '?':
+                        lineno = int(m.group(1))
+                        msg = m.group(2)
+                        syn_err = SyntaxError(msg)
+                        syn_err.lineno = lineno
+                        try:
+                            debugger.display_syntax_error(syn_err, source=self.source_code, filename=str(self.source_file))
+                        except Exception:
+                            print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
+                    else:
+                        print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
                 ans = input("\n\033[1;33mDo you want to continue compilation despite type errors? [y/N]: \033[0m").strip().lower()
                 if ans not in ('y', 'yes'):
                     return False
@@ -2176,25 +2255,25 @@ class StandaloneCompiler:
             success = False
             
             if comp == 'msvc':
-                success = self._compile_msvc(is_last_attempt=is_last)
+                success = self._compile_msvc()
             elif comp == 'clang':
                 bare_metal = (self.target == 'linux' and (platform.system() == 'Windows' or self.link_mode == 'static'))
-                success = self._compile_clang(bare_metal=bare_metal, is_last_attempt=is_last)
+                success = self._compile_clang(bare_metal=bare_metal)
             elif comp == 'gcc':
                 if self.target == 'windows':
-                    success = self._compile_mingw(is_last_attempt=is_last)
+                    success = self._compile_mingw()
                 else:
-                    success = self._compile_gcc(is_last_attempt=is_last)
+                    success = self._compile_gcc()
                     
             if success:
                 return True
             else:
                 if not is_last:
-                    self.log(f"Compilation with {comp.upper()} failed. Falling back to another compiler...", "WARN")
+                    self.log(f"\n[!] Compilation with {comp.upper()} failed. Falling back to the next compiler...", "WARN")
                 
         return False
 
-    def _compile_msvc(self, is_last_attempt: bool = True) -> bool:
+    def _compile_msvc(self) -> bool:
         self.log("Trying MSVC...")
         try:
             cl_exe = self._find_msvc_cl()
@@ -2232,22 +2311,21 @@ class StandaloneCompiler:
             if self.asm_out:
                 cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + [f'/Fa{self.output_exe}', '/c', '/FAs']
             else:
-                cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + ([self.res_file] if self.res_file else []) + [f'/Fe{self.output_exe}', '/link'] + msvc_link_flags.split() + ['opengl32.lib', 'winmm.lib', 'kernel32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib']
+                cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + ([self.res_file] if self.res_file else []) + [f'/Fe{self.output_exe}', '/link'] + msvc_link_flags.split() + self._get_windows_libs('msvc')
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists()):
+            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists() or self.output_exe.with_suffix('.scr').exists()):
                 return True
                 
-            if is_last_attempt:
-                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            self.log(f"\n[!] Compiler output for MSVC:", "ERROR")
+            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            if is_last_attempt:
-                self.log(f"Compiler execution failed: {e}", "ERROR")
+            self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
     
-    def _compile_clang(self, bare_metal: bool = False, is_last_attempt: bool = True) -> bool:
+    def _compile_clang(self, bare_metal: bool = False) -> bool:
         desc = "WebAssembly Build" if self.target == 'wasm' else ("optimized ELF build" if self.target == 'linux' and not bare_metal else "optimized freestanding PE/ELF build")
         self.log(f"Trying Clang ({desc})...")
         try:
@@ -2263,6 +2341,11 @@ class StandaloneCompiler:
             elif self.target == 'wasm':
                 cmd.append('--target=wasm32-unknown-unknown')
                 cmd.append('-nostdlib')
+            elif self.target == 'windows':
+                target_triple = "i686-w64-mingw32" if self.m32 else "x86_64-w64-mingw32"
+                cmd.append(f'--target={target_triple}')
+                if platform.system() == 'Windows':
+                    cmd.append('-fuse-ld=lld')
             
             cmd += self._get_compiler_flags('clang').split() + srcs + ([self.res_file] if self.res_file and not self.asm_out else [])
             
@@ -2283,11 +2366,8 @@ class StandaloneCompiler:
                             '-Wl,--no-rosegment'    
                         ])
                 elif self.target == 'windows':
-                    if not self._is_msvc_clang():
-                        cmd.append('-Wl,-s')                 
-                    cmd.extend([
-                        '-lopengl32', '-lwinmm', '-lkernel32', '-luser32', '-lgdi32', '-ladvapi32', '-lshell32', '-lole32'
-                    ])
+                    cmd.append('-Wl,-s')                 
+                    cmd.extend(self._get_windows_libs('clang'))
                 elif self.target == 'wasm':
                     cmd.extend([
                         '-mbulk-memory',
@@ -2304,15 +2384,14 @@ class StandaloneCompiler:
                     self.output_exe.with_suffix('.exe').replace(self.output_exe)
                 return True
                 
-            if is_last_attempt:
-                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            self.log(f"\n[!] Compiler output for CLANG:", "ERROR")
+            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            if is_last_attempt:
-                self.log(f"Compiler execution failed: {e}", "ERROR")
+            self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
-    def _compile_mingw(self, is_last_attempt: bool = True) -> bool:
+    def _compile_mingw(self) -> bool:
         self.log("Trying MinGW (gcc)...")
         try:
             srcs = [str(self.c_file)] + self.extra_files
@@ -2348,22 +2427,21 @@ class StandaloneCompiler:
             cmd += ['-o', str(self.output_exe)]
             
             if not self.asm_out:
-                cmd += self._get_linker_flags('gcc').split() + ['-lopengl32', '-lwinmm', '-lkernel32', '-luser32', '-lntdll', '-lgdi32', '-ladvapi32', '-lshell32', '-lole32']
+                cmd += self._get_linker_flags('gcc').split() + self._get_windows_libs('gcc')
                 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
 
-            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists()):
+            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists() or self.output_exe.with_suffix('.scr').exists()):
                 return True
                 
-            if is_last_attempt:
-                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            self.log(f"\n[!] Compiler output for {compiler_bin.upper()}:", "ERROR")
+            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            if is_last_attempt:
-                self.log(f"Compiler execution failed: {e}", "ERROR")
+            self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
-    def _compile_gcc(self, is_last_attempt: bool = True) -> bool:
+    def _compile_gcc(self) -> bool:
         self.log("Trying GCC (Linux)...")
         try:
             cmd = ['gcc'] + self._get_compiler_flags('gcc').split() + [str(self.c_file)] + self.extra_files
@@ -2384,12 +2462,11 @@ class StandaloneCompiler:
                     self.output_exe.with_suffix('.exe').replace(self.output_exe)
                 return True
                 
-            if is_last_attempt:
-                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            self.log(f"\n[!] Compiler output for GCC:", "ERROR")
+            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            if is_last_attempt:
-                self.log(f"Compiler execution failed: {e}", "ERROR")
+            self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
     def _find_msvc_cl(self) -> Optional[str]:
