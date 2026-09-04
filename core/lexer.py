@@ -8,6 +8,7 @@ class TokenType(Enum):
     RETURN = auto()
     ENDOFCODE = auto()
     IF = auto()
+    ELIF = auto()
     ELSE = auto()
     EXTERN = auto()
     WHILE = auto()
@@ -117,6 +118,7 @@ class Lexer:
         'let': TokenType.LET,
         'return': TokenType.RETURN,
         'if': TokenType.IF,
+        'elif': TokenType.ELIF,
         'else': TokenType.ELSE,
         'extern': TokenType.EXTERN,
         'while': TokenType.WHILE,
@@ -306,18 +308,6 @@ class Lexer:
                     elif nc == '\\': chars.append('\\')
                     elif nc == quote_char: chars.append(quote_char)
                     elif nc == '0': chars.append('\0')
-                    elif nc == 'x':
-                        self.advance()
-                        hex_str = self.source[self.pos:self.pos+2]
-                        if len(hex_str) == 2 and all(hc in '0123456789abcdefABCDEF' for hc in hex_str):
-                            chars.append(chr(int(hex_str, 16)))
-                            self.advance() 
-                            self.advance() 
-                            continue
-                        else:
-                            self._add_error("Invalid hex escape sequence")
-                            chars.append('x')
-                            continue
                     else: chars.append(nc)
                     self.advance()
             elif c == '\n':
@@ -343,10 +333,6 @@ class Lexer:
             if self.indent_stack and self.indent_stack[-1] != indent_level:
                 self._add_error(f"Incorrect indentation level at line {self.line}")
 
-    def _add_error(self, message: str) -> None:
-        self.errors.append((self.line, self.column, message))
-        self.recovery_mode = True
-
     def tokenize(self) -> List[Token]:
         src_len = len(self.source)
         while self.pos < src_len and self.source[self.pos] in ' \t':
@@ -368,11 +354,8 @@ class Lexer:
                     continue
                 indent_level = 0
                 temp_pos = self.pos
-                while temp_pos < src_len and self.source[temp_pos] in ' \t':
-                    if self.source[temp_pos] == '\t':
-                        indent_level += 4
-                    else:
-                        indent_level += 1
+                while temp_pos < src_len and self.source[temp_pos] == ' ':
+                    indent_level += 1
                     temp_pos += 1
                 if temp_pos >= src_len or self.source[temp_pos] in '\n#':
                     while self.pos < src_len and self.source[self.pos] != '\n':

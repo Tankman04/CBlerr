@@ -68,6 +68,7 @@ def print_help():
     print("  \033[1;32m-small\033[0m      Build for the smallest file size (still fast, but optimized for size over raw speed)\n")
     print("\033[1;34mEXTRA OPTIONS:\033[0m")
     print("  \033[32m-run\033[0m        Run the compiled executable immediately after a successful build")
+    print("  \033[32m-libc\033[0m       Use standard C library (libc) instead of built-in freestanding runtime")
     print("  \033[32m-asm\033[0m        Generate assembly code instead of an executable")
     print("  \033[32m-o <file>\033[0m   Set the name of the output executable")
     print("  \033[32m-t <os>\033[0m     Target OS: windows, linux, wasm, winlib (for DLLs), winsaver (for .scr screensavers)")
@@ -85,7 +86,7 @@ def print_help():
     print("  \033[32m-native\033[0m     Optimize code specifically for your current CPU architecture ")
     print("  \033[32m-v3\033[0m         Build with x86-64-v3. A modern baseline for CPUs from 2015 and newer.")
     print("  \033[32m-avx512\033[0m     Enable AVX-512. Extreme 512-bit vectorization for modern CPUs. A lot of CPU's don't support it.")
-    print("  \033[32m-avx256\033[0m     Enable AVX2 (256-bit). Blazing fast, but some CPUs may throttle (downclock) to save power & prevent overheating.")
+    print("  \033[32m-avx256\033[0m     Enable AVX2 (256-bit). Blazing fast, but some CPUs may throttle (downclock).")
     print("  \033[32m-avx128\033[0m     Enable AVX (128-bit). A safer speed boost avoiding severe CPU frequency drops.")
     print("  \033[32m--time\033[0m      Show detailed profiling (execution time of compiler stages)")
     print("  \033[32m--verbose\033[0m   \033[1;30m[DEPRECATED]\033[0m Show detailed logs and enable memory dumps (-derr)")
@@ -159,6 +160,7 @@ def main():
     m32 = False
     opt_level = None
     run_after_compile = False
+    use_libc = False
     asm_out = False
     profile_time = False
     gen_header = False
@@ -179,6 +181,9 @@ def main():
             i += 1
         elif arg == '-run':
             run_after_compile = True
+            i += 1
+        elif arg == '-libc':
+            use_libc = True
             i += 1
         elif arg == '-asm':
             asm_out = True
@@ -290,6 +295,7 @@ def main():
         extra_files=proj_cfg['files'],
         m32=m32,
         opt_level=opt_level,
+        use_libc=use_libc,
         asm_out=asm_out,
         profile_time=profile_time,
         gen_header=gen_header,

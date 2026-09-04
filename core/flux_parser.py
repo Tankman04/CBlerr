@@ -1,4 +1,3 @@
-
 from typing import Any, List
 from core.lexer import Token, TokenType
 from core.flux_ast import (
@@ -71,14 +70,38 @@ class Parser:
             raise SyntaxError("Expected type, but reached EOF")
 
         if token.type == TokenType.MULTIPLY:
-            star_count = 0
-            while self.current_token() and self.current_token().type == TokenType.MULTIPLY:
-                star_count += 1
-                self.advance()
+            self.advance()
             base = self.parse_type()
-            result = base
-            for _ in range(star_count): result = f"*{result}"
-            return result
+            if isinstance(base, str):
+                return f"*{base}"
+            return PointerType(base)
+            
+        if token.type == TokenType.LBRACKET:
+            self.advance()
+            size_token = self.expect(TokenType.NUMBER, "Expected array size")
+            size = size_token.value
+            self.expect(TokenType.RBRACKET, "Expected ']' after array size")
+            inner = str(self.parse_type())
+            return f"[{size}]{inner}"
+
+        if token.type == TokenType.DEF:
+            self.advance()
+            self.expect(TokenType.LPAREN, "Expected '(' in fn type")
+            args = []
+            if self.current_token() and self.current_token().type != TokenType.RPAREN:
+                while True:
+                    t = self.parse_type()
+                    args.append(str(t))
+                    if self.current_token() and self.current_token().type == TokenType.COMMA:
+                        self.advance()
+                        continue
+                    break
+            self.expect(TokenType.RPAREN, "Expected ')' in fn type")
+            ret = "void"
+            if self.current_token() and self.current_token().type == TokenType.ARROW:
+                self.advance()
+                ret = str(self.parse_type())
+            return f"fn({', '.join(args)}) -> {ret}"
 
         type_tokens = {
             TokenType.NAME, TokenType.INT, TokenType.STR, TokenType.BOOL, TokenType.FLOAT, TokenType.VOID,
@@ -181,6 +204,9 @@ class Parser:
 
         while self.current_token() and self.current_token().type != TokenType.EOF:
             try:
+                if self.current_token().type == TokenType.ENDOFCODE:
+                    break
+                    
                 if self.current_token().type == TokenType.NEWLINE:
                     self.skip_newlines()
                     continue
@@ -214,7 +240,14 @@ class Parser:
                 stmt = self.parse_statement()
                 if stmt:
                     if isinstance(stmt, Assign):
-                        global_vars.append(GlobalVariable(stmt.target, getattr(stmt, 'var_type', None), stmt.value, False))
+                        target_name = stmt.target
+                        if hasattr(target_name, 'name'):
+                            target_name = target_name.name
+                        global_vars.append(GlobalVariable(target_name, getattr(stmt, 'var_type', None), getattr(stmt, 'value', None), False))
+                    else:
+                        err = SyntaxError("Unexpected expression at global scope. Only declarations (def, let, struct, enum) are allowed.")
+                        err.lineno = getattr(stmt, 'line', self.current_token().line if self.current_token() else 0)
+                        self.errors.append(err)
                 else:
                     self.advance()
 
@@ -397,16 +430,27 @@ class Parser:
         if token.type == TokenType.LET:
             self.advance()
             name = self.expect(TokenType.NAME, "Expected variable name after let").value
-            self.expect(TokenType.ASSIGN, "Expected '=' in let")
-            val = self.parse_expression()
-            return Assign(name, val)
+            
+            var_type = None
+            if self.current_token() and self.current_token().type == TokenType.COLON:
+                self.advance()
+                var_type = self.parse_type()
+                
+            val = None
+            if self.current_token() and self.current_token().type == TokenType.ASSIGN:
+                self.advance()
+                val = self.parse_expression()
+            elif not var_type:
+                raise SyntaxError(f"Variable '{name}' must have a type or be initialized.")
+                
+            return Assign(name, val, var_type)
 
         expr = self.parse_expression()
         
         if isinstance(expr, Variable) and self.current_token() and self.current_token().type == TokenType.COLON:
             self.advance() 
             t = self.parse_type()
-            val = Literal(0, 'int')
+            val = None
             if self.current_token() and self.current_token().type == TokenType.ASSIGN:
                 self.advance()
                 val = self.parse_expression()
@@ -453,6 +497,39 @@ class Parser:
             v = None
         return Return(v)
 
+    def _parse_elif_or_else(self):
+        self.skip_newlines()
+        if self.current_token() and self.current_token().type == TokenType.ELIF:
+            start_line = self.current_token().line
+            self.advance()
+            cond = self.parse_expression()
+            self.expect(TokenType.COLON, "Expected ':' after elif")
+            self.skip_newlines()
+            self.expect(TokenType.INDENT, "Expected indent for elif body")
+            body = []
+            while self.current_token() and self.current_token().type != TokenType.DEDENT:
+                s = self.parse_statement()
+                if s: body.append(s)
+                self.skip_newlines()
+            self.expect(TokenType.DEDENT, "Expected dedent after elif body")
+            next_else = self._parse_elif_or_else()
+            return [IfStmt(cond, body, next_else, line=start_line)]
+            
+        elif self.current_token() and self.current_token().type == TokenType.ELSE:
+            self.advance()
+            self.expect(TokenType.COLON, "Expected ':' after else")
+            self.skip_newlines()
+            self.expect(TokenType.INDENT, "Expected indent for else body")
+            body = []
+            while self.current_token() and self.current_token().type != TokenType.DEDENT:
+                s = self.parse_statement()
+                if s: body.append(s)
+                self.skip_newlines()
+            self.expect(TokenType.DEDENT, "Expected dedent after else body")
+            return body
+            
+        return None
+
     def parse_if_stmt(self) -> IfStmt:
         self.expect(TokenType.IF, "Expected 'if'")
         cond = self.parse_expression()
@@ -466,18 +543,7 @@ class Parser:
             self.skip_newlines()
         self.expect(TokenType.DEDENT, "Expected dedent after if body")
         
-        else_body = None
-        if self.current_token() and self.current_token().type == TokenType.ELSE:
-            self.advance()
-            self.expect(TokenType.COLON, "Expected ':' after else")
-            self.skip_newlines()
-            self.expect(TokenType.INDENT, "Expected indent for else body")
-            else_body = []
-            while self.current_token() and self.current_token().type != TokenType.DEDENT:
-                s = self.parse_statement()
-                if s: else_body.append(s)
-                self.skip_newlines()
-            self.expect(TokenType.DEDENT, "Expected dedent after else body")
+        else_body = self._parse_elif_or_else()
         return IfStmt(cond, then, else_body)
 
     def parse_while_stmt(self) -> WhileLoop:

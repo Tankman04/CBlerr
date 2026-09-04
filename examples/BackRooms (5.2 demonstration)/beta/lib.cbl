@@ -1,31 +1,3 @@
-extern def sin(x: f64) -> f64
-extern def cos(x: f64) -> f64
-extern def tan(x: f64) -> f64
-extern def rand() -> int
-extern def malloc(size: int) -> *int
-extern def free(ptr: *int) -> void
-
-extern def GetConsoleWindow() -> *void
-extern def ShowWindow(hWnd: *void, nCmdShow: int) -> int
-extern def CreateWindowExA(dwExStyle: int, lpClassName: *void, lpWindowName: *void, dwStyle: int, x: int, y: int, nWidth: int, nHeight: int, hWndParent: *void, hMenu: *void, hInstance: *void, lpParam: *void) -> *void
-extern def GetDC(hwnd: *void) -> *void
-extern def ReleaseDC(hwnd: *void, hdc: *void) -> int
-extern def PeekMessageA(lpMsg: *void, hWnd: *void, wMsgFilterMin: int, wMsgFilterMax: int, wRemoveMsg: int) -> int
-extern def DispatchMessageA(lpMsg: *void) -> int
-extern def GetAsyncKeyState(vKey: int) -> i16
-extern def Sleep(dwMilliseconds: int) -> void
-extern def PlaySoundA(pszSound: *void, hmod: *void, fdwSound: int) -> int
-extern def ExitProcess(uExitCode: int) -> void
-extern def GetTickCount() -> int
-
-extern def GetCursorPos(lpPoint: *void) -> int
-extern def SetCursorPos(x: int, y: int) -> int
-extern def ClientToScreen(hWnd: *void, lpPoint: *void) -> int
-extern def ShowCursor(bShow: int) -> int
-extern def SetBkMode(hdc: *void, mode: int) -> int
-extern def SetTextColor(hdc: *void, color: int) -> int
-extern def TextOutA(hdc: *void, x: int, y: int, lpString: *void, c: int) -> int
-
 extern def ChoosePixelFormat(hdc: *void, ppfd: *int) -> int
 extern def SetPixelFormat(hdc: *void, format: int, ppfd: *int) -> int
 extern def wglCreateContext(hdc: *void) -> *void

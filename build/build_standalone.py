@@ -10,6 +10,10 @@ from typing import List, Optional, Tuple, Dict, Any
 from collections import deque
 import math
 
+ESCAPE_TRANS = str.maketrans({
+    '\\': '\\\\', '"': '\\"', '\n': '\\n', '\r': '\\r', '\t': '\\t'
+})
+
 def is_gui_app_code(source_code: str) -> bool:
     clean = re.sub(r'//.*|/\*.*?\*/|"(?:\\.|[^"\\])*"', '', source_code, flags=re.DOTALL).lower()
     gui_calls = ["winmain", "windowproc", "createwindow", "dispatchmessage", "setwindowcompositionattribute"]
@@ -20,20 +24,20 @@ def is_packable_code(source_code: str) -> bool:
         return False
     return True
 
-def fold_constants(node: Any, debugger: Any = None) -> Any:
+def fold_constants(node: Any) -> Any:
     if isinstance(node, (list, tuple)):
         if isinstance(node, list):
             for i in range(len(node)):
-                node[i] = fold_constants(node[i], debugger)
+                node[i] = fold_constants(node[i])
         elif isinstance(node, tuple):
-            node = tuple(fold_constants(x, debugger) for x in node)
+            node = tuple(fold_constants(x) for x in node)
 
     if not hasattr(node, '__dict__'):
         return node
 
     for k, v in vars(node).items():
         if isinstance(v, (list, tuple)) or hasattr(v, '__dict__'):
-            setattr(node, k, fold_constants(v, debugger))
+            setattr(node, k, fold_constants(v))
 
     try:
         from core.flux_ast import BinaryOp, Literal, Call, ArrayLiteral, IfStmt
@@ -86,18 +90,11 @@ def fold_constants(node: Any, debugger: Any = None) -> Any:
                         elif op == '-': res = l_val - r_val
                         elif op == '*': res = l_val * r_val
                         elif op == '/': 
-                            if r_val == 0:
-                                if debugger: debugger.log_error(f"Constant folding error: Division by zero")
-                                return node
                             if isinstance(l_val, int) and isinstance(r_val, int):
                                 res = l_val // r_val
                             else:
                                 res = l_val / r_val
-                        elif op == '%': 
-                            if r_val == 0:
-                                if debugger: debugger.log_error(f"Constant folding error: Modulo by zero")
-                                return node
-                            res = l_val % r_val
+                        elif op == '%': res = l_val % r_val
                         elif op == '**': res = l_val ** r_val
                         elif op == '&' and isinstance(l_val, int) and isinstance(r_val, int): res = l_val & r_val
                         elif op == '|' and isinstance(l_val, int) and isinstance(r_val, int): res = l_val | r_val
@@ -113,10 +110,7 @@ def fold_constants(node: Any, debugger: Any = None) -> Any:
     except: pass
     return node
 
-def run_dce(ast: Any, is_lib: bool = False) -> Any:
-    if is_lib:
-        return ast
-        
+def run_dce(ast: Any) -> Any:
     if not hasattr(ast, 'functions') or not hasattr(ast, 'global_vars'):
         return ast
         
@@ -125,7 +119,7 @@ def run_dce(ast: Any, is_lib: bool = False) -> Any:
     
     reachable_funcs = set()
     reachable_globals = set()
-    roots = ['main', 'WinMain', 'CblerrStartup', 'WindowProc']
+    roots = ['main', 'WinMain', 'CblerrStartup', 'WindowProc', 'DllMain']
     
     for f in ast.functions:
         if getattr(f, 'is_extern', False) and f.name not in roots:
@@ -296,9 +290,6 @@ class StaticMemoryAnalyzer:
                         elif state == 'FREED':
                             self.report(f"Double Free: Pointer '{arg_name}' is already freed.", expr)
                         states[root] = 'FREED'
-                        for k in list(states.keys()):
-                            if get_root_alias(k) == root:
-                                states[k] = 'FREED'
                 else:
                     for arg in (expr.args or []): visit_expr(arg)
 
@@ -344,10 +335,8 @@ class StaticMemoryAnalyzer:
             elif cname == 'Return':
                 visit_expr(stmt.value)
                 ret_name = get_root_alias(get_target_name(stmt.value)) if stmt.value else None
-                ret_aliases = {k for k in states if get_root_alias(k) == ret_name}
-                ret_aliases.add(ret_name)
                 for var, state in states.items():
-                    if state == 'ALLOCATED' and var not in ret_aliases:
+                    if state == 'ALLOCATED' and var != ret_name:
                         self.report(f"Memory Leak: '{var}' is malloc'd but not freed before return.", stmt)
             elif cname == 'IfStmt':
                 visit_expr(stmt.condition)
@@ -370,19 +359,19 @@ class StaticMemoryAnalyzer:
                 visit_stmt(stmt)
 
 class CBLCodeEmitter:
-    def __init__(self, target: str = "windows", module_name: str = "cblerr_module", source_filename: str = "", link_mode: Optional[str] = None, is_gui_app: bool = False):
+    def __init__(self, target: str = "windows", module_name: str = "cblerr_module", source_filename: str = "", link_mode: Optional[str] = None, is_gui_app: bool = False, use_libc: bool = False):
         target_lower = target.lower()
         self.is_dll = (target_lower == "winlib")
-        self.is_scr = (target_lower in ("winsaver", "screensaver"))
         if target_lower == "wasm":
             self.target = "wasm"
         else:
-            self.target = "windows" if (self.is_dll or self.is_scr or target_lower == "windows") else target_lower
+            self.target = "windows" if self.is_dll else target_lower
             
         self.module_name = module_name
         self.source_filename = source_filename
         self.link_mode = link_mode
         self.is_gui_app = is_gui_app
+        self.use_libc = use_libc
         self.needs_utf8 = False
 
         self.code_lines: List[str] = []
@@ -403,26 +392,8 @@ class CBLCodeEmitter:
         
         self.win_msvcrt_registry = {
             "printf": ("int", "(const char*, ...)"),
-            "sprintf": ("int", "(char*, const char*, ...)"), 
-            "puts": ("int", "(const char*)"),
-            "scanf": ("int", "(const char*, ...)"),
-            
-            "_kbhit": ("int", "(void)"),
-            "_getch": ("int", "(void)"),
-            "kbhit": ("int", "(void)"),
-            "getch": ("int", "(void)"),
-            "getchar": ("int", "(void)"),
-            "putchar": ("int", "(int)"),
-            
-            "fopen": ("void*", "(const char*, const char*)"),
-            "fclose": ("int", "(void*)"),
-            "fread": ("size_t", "(void*, size_t, size_t, void*)"),
-            "fwrite": ("size_t", "(const void*, size_t, size_t, void*)"),
-            "fseek": ("int", "(void*, long, int)"),
-            "ftell": ("long", "(void*)"),
-            
-            "system": ("int", "(const char*)"),
-            "exit": ("void", "(int)")
+            "sprintf": ("int", "(char*, const char*, ...)"), "puts": ("int", "(const char*)"),
+            "scanf": ("int", "(const char*, ...)")
         }
 
     def emit_line(self, line: str = ""):
@@ -432,17 +403,7 @@ class CBLCodeEmitter:
             self.code_lines.append("")
 
     def _escape_string(self, s: str) -> str:
-        b = s.encode('utf-8')
-        res = []
-        for byte in b:
-            if byte == 92: res.append('\\\\')
-            elif byte == 34: res.append('\\"')
-            elif byte == 10: res.append('\\n')
-            elif byte == 13: res.append('\\r')
-            elif byte == 9: res.append('\\t')
-            elif 32 <= byte <= 126: res.append(chr(byte))
-            else: res.append(f"\\{byte:03o}")
-        return ''.join(res)
+        return s.translate(ESCAPE_TRANS)
 
     def _get_local_c_type(self, var_name: str) -> Optional[str]:
         if self.local_vars_stack and var_name in self.local_vars_stack[-1]:
@@ -482,13 +443,26 @@ class CBLCodeEmitter:
                             self.string_pool[fast_val] = f"__str_const_{len(self.string_pool)}"
                         setattr(node, '_is_fast_print', fast_val)
                         self.used_externs.add('Cblerr_print_fast')
-                        if self.target == 'windows':
+                        if self.target == 'windows' and not self.use_libc:
                             self.used_externs.add('WriteConsoleA')
                             self.used_externs.add('GetStdHandle')
                         return
                     
+                    if len(node.args) == 1:
+                        arg = node.args[0]
+                        if arg.__class__.__name__ == 'Literal' and getattr(arg, 'type', '') == 'str':
+                            fast_val = arg.value + ("" if self.target == 'wasm' else "\n")
+                            if fast_val not in self.string_pool:
+                                self.string_pool[fast_val] = f"__str_const_{len(self.string_pool)}"
+                            setattr(node, '_is_fast_print', fast_val)
+                            self.used_externs.add('Cblerr_print_fast')
+                            if self.target == 'windows' and not self.use_libc:
+                                self.used_externs.add('WriteConsoleA')
+                                self.used_externs.add('GetStdHandle')
+                            return
+                            
                     self.used_externs.add('Cblerr_print_string')
-                    if self.target == 'windows':
+                    if self.target == 'windows' and not self.use_libc:
                         self.used_externs.add('WriteConsoleA')
                         self.used_externs.add('GetStdHandle')
                 else:
@@ -545,13 +519,13 @@ class CBLCodeEmitter:
         runtime_provided = {"sys_write", "sys_mmap", "sys_munmap", "Cblerr_print_string", "Cblerr_print_fast", "flux_string_eq"}
         runtime_provided.update({"malloc", "free", "bump", "rand", "srand", "time", "clock"})
         runtime_provided.update({'sin', 'cos', 'tan', 'pow', 'sqrt', 'asin', 'acos', 'atan', 'atan2', 'log', 'exp', 'floor', 'ceil', 'fmod', 'abs', 'fabs'})
-        runtime_provided.update({'memset', 'memcpy', 'memmove', 'memcmp', 'strcmp', 'strlen'})
+        runtime_provided.update({'memset', 'memcpy', 'memmove', 'memcmp', 'strcmp', 'strlen', 'strcpy', 'strcat', 'strchr', 'strstr', 'atoi', 'itoa', 'isdigit', 'isalpha', 'isspace', 'toupper', 'tolower'})
         runtime_provided.add("wasm_print")
 
         if program.functions:
             for func_def in program.functions:
                 if getattr(func_def, 'is_extern', False):
-                    if self.target == 'windows' and func_def.name in self.win_msvcrt_registry: continue
+                    if not self.use_libc and self.target == 'windows' and func_def.name in self.win_msvcrt_registry: continue
                     if func_def.name in runtime_provided: continue
                     sig = self._generate_function_signature(func_def)
                     self.emit_line(f"{sig};")
@@ -571,22 +545,36 @@ class CBLCodeEmitter:
         return "\n".join(self.code_lines)
 
     def _emit_prelude(self):
-        self.emit_line("typedef signed char int8_t;")
-        self.emit_line("typedef short int16_t;")
-        self.emit_line("typedef int int32_t;")
-        self.emit_line("typedef long long int64_t;")
-        self.emit_line("typedef unsigned char uint8_t;")
-        self.emit_line("typedef unsigned short uint16_t;")
-        self.emit_line("typedef unsigned int uint32_t;")
-        self.emit_line("typedef unsigned long long uint64_t;")
-        self.emit_line("#if defined(__LP64__) || defined(_WIN64) || defined(__wasm64__)")
-        self.emit_line("typedef unsigned long long size_t;")
-        self.emit_line("#else")
-        self.emit_line("typedef unsigned int size_t;")
-        self.emit_line("#endif")
-        self.emit_line("#define bool _Bool")
-        self.emit_line("#define true 1")
-        self.emit_line("#define false 0")
+        if self.use_libc:
+            self.emit_line("#include <stdint.h>")
+            self.emit_line("#include <stdbool.h>")
+            self.emit_line("#include <stdio.h>")
+            self.emit_line("#include <stdlib.h>")
+            self.emit_line("#include <string.h>")
+            self.emit_line("#include <math.h>")
+            self.emit_line("#include <time.h>")
+            self.emit_line("#include <ctype.h>")
+            self.emit_line("#if defined(_WIN32)")
+            self.emit_line("extern int __stdcall SetConsoleOutputCP(unsigned int);")
+            self.emit_line("#endif")
+        else:
+            self.emit_line("typedef signed char int8_t;")
+            self.emit_line("typedef short int16_t;")
+            self.emit_line("typedef int int32_t;")
+            self.emit_line("typedef long long int64_t;")
+            self.emit_line("typedef unsigned char uint8_t;")
+            self.emit_line("typedef unsigned short uint16_t;")
+            self.emit_line("typedef unsigned int uint32_t;")
+            self.emit_line("typedef unsigned long long uint64_t;")
+            self.emit_line("#if defined(__LP64__) || defined(_WIN64) || defined(__wasm64__)")
+            self.emit_line("typedef unsigned long long size_t;")
+            self.emit_line("#else")
+            self.emit_line("typedef unsigned int size_t;")
+            self.emit_line("#endif")
+            self.emit_line("#define bool _Bool")
+            self.emit_line("#define true 1")
+            self.emit_line("#define false 0")
+            
         self.emit_line("#define NULL ((void*)0)")
         self.emit_line("#define CBL_UNLIKELY(x) __builtin_expect(!!(x), 0)")
         self.emit_line()
@@ -595,17 +583,59 @@ class CBLCodeEmitter:
         self.emit_line("    long length;")
         self.emit_line("} string;")
         self.emit_line("typedef string flux_string;")
+        
+        if self.use_libc:
+            self.emit_line("#define main cblerr_main")
         self.emit_line()
 
     def _emit_runtime(self):
         all_user_funcs = {f.name for f in self.program.functions} if hasattr(self, 'program') and hasattr(self.program, 'functions') else set()
         user_impls = {f.name for f in self.program.functions if not getattr(f, 'is_extern', False)} if hasattr(self, 'program') and hasattr(self.program, 'functions') else set()
 
-        runtime_provided = {"sys_write", "sys_mmap", "sys_munmap", "Cblerr_print_string", "Cblerr_print_fast", "flux_string_eq"}
-        runtime_provided.update({"malloc", "free", "bump", "rand", "srand", "time", "clock"})
-        runtime_provided.update({'sin', 'cos', 'tan', 'pow', 'sqrt', 'asin', 'acos', 'atan', 'atan2', 'log', 'exp', 'floor', 'ceil', 'fmod', 'abs', 'fabs'})
-        runtime_provided.update({'memset', 'memcpy', 'memmove', 'memcmp', 'strcmp', 'strlen'})
-        runtime_provided.add("wasm_print")
+        if self.use_libc:
+            if 'bump' in self.used_externs and "bump" not in user_impls:
+                self.emit_line("static char* cbl_arena_base = 0;")
+                self.emit_line("static size_t cbl_arena_offset = 0;")
+                self.emit_line("static inline void* bump(size_t size) {")
+                self.emit_line("    if (!cbl_arena_base) cbl_arena_base = (char*)malloc(1024 * 1024 * 64); // 64 MB arena")
+                self.emit_line("    size_t align = (size + 7) & ~7;")
+                self.emit_line("    void* ptr = cbl_arena_base + cbl_arena_offset;")
+                self.emit_line("    cbl_arena_offset += align;")
+                self.emit_line("    return ptr;")
+                self.emit_line("}")
+                
+            if 'Cblerr_print_string' in self.used_externs and "Cblerr_print_string" not in user_impls:
+                self.emit_line("static inline void Cblerr_print_string(flux_string s) {")
+                self.emit_line("    printf(\"%.*s\\n\", (int)s.length, s.data);")
+                self.emit_line("}")
+                
+            if 'Cblerr_print_fast' in self.used_externs and "Cblerr_print_fast" not in user_impls:
+                self.emit_line("static inline void Cblerr_print_fast(flux_string s) {")
+                self.emit_line("    printf(\"%.*s\", (int)s.length, s.data);")
+                self.emit_line("}")
+                
+            if ('memcmp' in self.used_externs or 'strcmp' in self.used_externs or 'flux_string_eq' in self.used_externs) and "flux_string_eq" not in user_impls:
+                self.emit_line("static inline bool flux_string_eq(flux_string a, flux_string b) {")
+                self.emit_line("    if (a.length != b.length) return false;")
+                self.emit_line("    if (!a.length) return true;")
+                self.emit_line("    if (!a.data || !b.data) return false;")
+                self.emit_line("    return memcmp(a.data, b.data, a.length) == 0;")
+                self.emit_line("}")
+                
+            if 'itoa' in self.used_externs and "itoa" not in user_impls:
+                self.emit_line("static inline char* cbl_itoa(int val, char *buf, int radix) {")
+                self.emit_line("    if (radix < 2 || radix > 36) { buf[0] = '\\0'; return buf; }")
+                self.emit_line("    char *p = buf, *p1 = buf, tmp; int v; unsigned int uval;")
+                self.emit_line("    if (val < 0 && radix == 10) { uval = -val; *p++ = '-'; p1++; } else { uval = (unsigned int)val; }")
+                self.emit_line("    do { v = uval % radix; uval /= radix; *p++ = \"0123456789abcdefghijklmnopqrstuvwxyz\"[v]; } while (uval);")
+                self.emit_line("    *p-- = '\\0';")
+                self.emit_line("    while (p1 < p) { tmp = *p; *p-- = *p1; *p1++ = tmp; }")
+                self.emit_line("    return buf;")
+                self.emit_line("}")
+                self.emit_line("#define itoa cbl_itoa")
+
+            self.emit_line("static inline void CblerrInitMsvcrt(void) {}")
+            return
 
         if self.target == "windows":
             if "LoadLibraryA" not in all_user_funcs:
@@ -937,9 +967,6 @@ class CBLCodeEmitter:
         math_externs = {'sin', 'cos', 'tan', 'pow', 'sqrt', 'asin', 'acos', 'atan', 'atan2', 'log', 'exp', 'floor', 'ceil', 'fmod', 'abs', 'fabs'}
         used_math = [name for name in math_externs if name in self.used_externs]
         
-        if 'acos' in used_math and 'asin' not in used_math:
-            used_math.append('asin')
-        
         for f in used_math:
             self.emit_line(f"#define {f} cbl_{f}")
 
@@ -981,11 +1008,11 @@ class CBLCodeEmitter:
                 
             if 'tan' in used_math and "tan" not in user_impls:
                 self.emit_line("static inline double cbl_tan(double x) {")
-                self.emit_line("    double rx = __builtin_fmod(x, 3.141592653589793);")
-                self.emit_line("    if (rx > 1.5707963267948966) rx -= 3.141592653589793;")
-                self.emit_line("    else if (rx < -1.5707963267948966) rx += 3.141592653589793;")
-                self.emit_line("    double x2 = rx * rx;")
-                self.emit_line("    double num = rx * (1.0 + x2 * (-0.11528658694082823 + x2 * 0.002241676648721473));")
+                self.emit_line("    double z = x * 0.3183098861837907;")
+                self.emit_line("    double k = (double)((int64_t)(z + (z >= 0.0 ? 0.5 : -0.5)));")
+                self.emit_line("    double dx = x - k * 3.141592653589793;")
+                self.emit_line("    double x2 = dx * dx;")
+                self.emit_line("    double num = dx * (1.0 + x2 * (-0.11528658694082823 + x2 * 0.002241676648721473));")
                 self.emit_line("    double den = 1.0 + x2 * (-0.4486199202741615 + x2 * (0.03964952093557997 - x2 * 0.0006275819717141527));")
                 self.emit_line("    return num / den;")
                 self.emit_line("}")
@@ -993,47 +1020,36 @@ class CBLCodeEmitter:
             if 'atan' in used_math and "atan" not in user_impls:
                 self.emit_line("static inline double cbl_atan(double x) {")
                 self.emit_line("    double a = (x < 0.0 ? -x : x);")
-                self.emit_line("    int invert = a > 1.0;")
-                self.emit_line("    if (invert) a = 1.0 / a;")
-                self.emit_line("    double z2 = a * a;")
-                self.emit_line("    double p;")
-                self.emit_line("    if (a > 0.41421356237309503) {")
-                self.emit_line("        double num = (a - 1.0) / (a + 1.0);")
-                self.emit_line("        double num2 = num * num;")
-                self.emit_line("        p = 0.7853981633974483 + num * (1.0 + num2 * (-0.3333333333333333 + num2 * (0.2 + num2 * (-0.14285714285714285 + num2 * (0.1111111111111111 + num2 * (-0.09090909090909091 + num2 * 0.07692307692307693))))));")
-                self.emit_line("    } else {")
-                self.emit_line("        p = a * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.2 + z2 * (-0.14285714285714285 + z2 * (0.1111111111111111 + z2 * (-0.09090909090909091 + z2 * 0.07692307692307693))))));")
-                self.emit_line("    }")
-                self.emit_line("    if (invert) p = 1.5707963267948966 - p;")
-                self.emit_line("    return x < 0.0 ? -p : p;")
+                self.emit_line("    double m1 = (a > 1.0);") 
+                self.emit_line("    double z = (1.0 - m1) * a + m1 * (1.0 / (a + 1e-16));")
+                self.emit_line("    double z2 = z * z;")
+                self.emit_line("    double p = z * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.19999999999999996 + z2 * (-0.14285714285714285 + z2 * 0.1111111111111111))));")
+                self.emit_line("    p = (1.0 - m1) * p + m1 * (1.5707963267948966 - p);")
+                self.emit_line("    double m2 = (x < 0.0);")
+                self.emit_line("    return p * (1.0 - 2.0 * m2);")
                 self.emit_line("}")
 
             if 'atan2' in used_math and "atan2" not in user_impls:
                 self.emit_line("static inline double cbl_atan2(double y, double x) {")
-                self.emit_line("    if (y == 0.0 && x == 0.0) return 0.0;")
-                self.emit_line("    double abs_y = (y < 0.0 ? -y : y);")
+                self.emit_line("    double abs_y = (y < 0.0 ? -y : y) + 1e-16;")
                 self.emit_line("    double abs_x = (x < 0.0 ? -x : x);")
-                self.emit_line("    int invert = abs_y > abs_x;")
-                self.emit_line("    double a = invert ? (abs_x / abs_y) : (abs_y / abs_x);")
-                self.emit_line("    double z2 = a * a;")
-                self.emit_line("    double p;")
-                self.emit_line("    if (a > 0.41421356237309503) {")
-                self.emit_line("        double num = (a - 1.0) / (a + 1.0);")
-                self.emit_line("        double num2 = num * num;")
-                self.emit_line("        p = 0.7853981633974483 + num * (1.0 + num2 * (-0.3333333333333333 + num2 * (0.2 + num2 * (-0.14285714285714285 + num2 * (0.1111111111111111 + num2 * (-0.09090909090909091 + num2 * 0.07692307692307693))))));")
-                self.emit_line("    } else {")
-                self.emit_line("        p = a * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.2 + z2 * (-0.14285714285714285 + z2 * (0.1111111111111111 + z2 * (-0.09090909090909091 + z2 * 0.07692307692307693))))));")
-                self.emit_line("    }")
-                self.emit_line("    if (invert) p = 1.5707963267948966 - p;")
-                self.emit_line("    if (x < 0.0) p = 3.141592653589793 - p;")
-                self.emit_line("    return y < 0.0 ? -p : p;")
+                self.emit_line("    double m1 = (abs_y > abs_x);")
+                self.emit_line("    double num = (1.0 - m1) * abs_y + m1 * abs_x;")
+                self.emit_line("    double den = (1.0 - m1) * abs_x + m1 * abs_y;")
+                self.emit_line("    double z = num / den;")
+                self.emit_line("    double z2 = z * z;")
+                self.emit_line("    double p = z * (1.0 + z2 * (-0.3333333333333333 + z2 * (0.19999999999999996 + z2 * (-0.14285714285714285 + z2 * 0.1111111111111111))));")
+                self.emit_line("    p = (1.0 - m1) * p + m1 * (1.5707963267948966 - p);")
+                self.emit_line("    double m2 = (x < 0.0);")
+                self.emit_line("    p = (1.0 - m2) * p + m2 * (3.141592653589793 - p);")
+                self.emit_line("    double m3 = (y < 0.0);")
+                self.emit_line("    return p * (1.0 - 2.0 * m3);")
                 self.emit_line("}")
 
             if 'asin' in used_math and "asin" not in user_impls:
                 self.emit_line("static inline double cbl_asin(double x) {")
                 self.emit_line("    double a = (x < 0.0 ? -x : x);")
-                self.emit_line("    if (a > 1.0) return 0.0 / 0.0;")
-                self.emit_line("    double poly = 1.5707963267948966 + a * (-0.2145988016 + a * (0.0889789874 + a * (-0.0501743046 + a * (0.0308918810 + a * (-0.0170881256 + a * (0.0066700901 - a * 0.0012624911))))));")
+                self.emit_line("    double poly = 1.5707963050 + a * (-0.2145988016 + a * (0.0889789874 + a * (-0.0501743046 + a * (0.0308918810 + a * (-0.0170881256 + a * (0.0066700901 - a * 0.0012624911))))));")
                 self.emit_line("    double res = 1.5707963267948966 - __builtin_sqrt(1.0 - a) * poly;")
                 self.emit_line("    double m2 = (x < 0.0);")
                 self.emit_line("    return res * (1.0 - 2.0 * m2);")
@@ -1059,69 +1075,43 @@ class CBLCodeEmitter:
                 self.emit_line("}")
             self.emit_line()
 
-        mem_funcs = {'memset', 'memcpy', 'memmove', 'memcmp', 'strcmp', 'strlen'}
-        used_mem = [name for name in mem_funcs if name in self.used_externs]
+        string_ext_funcs = {'strcpy', 'strcat', 'strchr', 'strstr', 'atoi', 'itoa', 'isdigit', 'isalpha', 'isspace', 'toupper', 'tolower'}
+        used_string_ext = [name for name in string_ext_funcs if name in self.used_externs]
         
-        for implicit in ('memcpy', 'memset', 'memcmp'):
-            if implicit not in used_mem:
-                used_mem.append(implicit)
-
-        for f in used_mem:
+        for f in used_string_ext:
             self.emit_line(f"#define {f} cbl_{f}")
 
-        if used_mem:
-            if 'memset' in used_mem and 'memset' not in user_impls:
-                self.emit_line("static inline void* cbl_memset(void *dest, int val, size_t count) {")
-                self.emit_line("    char *d = (char*)dest;")
-                self.emit_line("    uint64_t v = (unsigned char)val;")
-                self.emit_line("    v |= v << 8; v |= v << 16; v |= v << 32;")
-                self.emit_line("    while (count >= 8) { *(uint64_t*)d = v; d += 8; count -= 8; }")
-                self.emit_line("    while (count--) *d++ = (char)val;")
-                self.emit_line("    return dest;")
+        if used_string_ext:
+            if 'strcpy' in used_string_ext and 'strcpy' not in user_impls:
+                self.emit_line("static inline char* cbl_strcpy(char *dest, const char *src) { char *d = dest; while ((*d++ = *src++)); return dest; }")
+            if 'strcat' in used_string_ext and 'strcat' not in user_impls:
+                self.emit_line("static inline char* cbl_strcat(char *dest, const char *src) { char *p = dest; while (*p) p++; while ((*p++ = *src++)); return dest; }")
+            if 'strchr' in used_string_ext and 'strchr' not in user_impls:
+                self.emit_line("static inline char* cbl_strchr(const char *s, int c) { while (*s && *s != (char)c) s++; return (*s == (char)c) ? (char*)s : ((void*)0); }")
+            if 'strstr' in used_string_ext and 'strstr' not in user_impls:
+                self.emit_line("static inline char* cbl_strstr(const char *h, const char *n) { if (!*n) return (char*)h; for (; *h; h++) { if (*h == *n) { const char *x=h, *y=n; while (*x && *y && *x==*y) { x++; y++; } if (!*y) return (char*)h; } } return ((void*)0); }")
+            if 'atoi' in used_string_ext and 'atoi' not in user_impls:
+                self.emit_line("static inline int cbl_atoi(const char *s) { int res = 0, sign = 1; while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r') s++; if (*s == '-' || *s == '+') sign = (*s++ == '-') ? -1 : 1; while (*s >= '0' && *s <= '9') res = res * 10 + (*s++ - '0'); return res * sign; }")
+            if 'itoa' in used_string_ext and 'itoa' not in user_impls:
+                self.emit_line("static inline char* cbl_itoa(int val, char *buf, int radix) {")
+                self.emit_line("    if (radix < 2 || radix > 36) { buf[0] = '\\0'; return buf; }")
+                self.emit_line("    char *p = buf, *p1 = buf, tmp; int v; unsigned int uval;")
+                self.emit_line("    if (val < 0 && radix == 10) { uval = -val; *p++ = '-'; p1++; } else { uval = (unsigned int)val; }")
+                self.emit_line("    do { v = uval % radix; uval /= radix; *p++ = \"0123456789abcdefghijklmnopqrstuvwxyz\"[v]; } while (uval);")
+                self.emit_line("    *p-- = '\\0';")
+                self.emit_line("    while (p1 < p) { tmp = *p; *p-- = *p1; *p1++ = tmp; }")
+                self.emit_line("    return buf;")
                 self.emit_line("}")
-            
-            if 'memcpy' in used_mem and 'memcpy' not in user_impls:
-                self.emit_line("static inline void* cbl_memcpy(void *dest, const void *src, size_t count) {")
-                self.emit_line("    char *d = (char*)dest; const char *s = (const char*)src;")
-                self.emit_line("    while (count >= 8) { *(uint64_t*)d = *(const uint64_t*)s; d += 8; s += 8; count -= 8; }")
-                self.emit_line("    while (count--) *d++ = *s++;")
-                self.emit_line("    return dest;")
-                self.emit_line("}")
-
-            if 'memcmp' in used_mem and 'memcmp' not in user_impls:
-                self.emit_line("static inline int cbl_memcmp(const void *s1, const void *s2, size_t count) {")
-                self.emit_line("    const char *p1 = (const char*)s1, *p2 = (const char*)s2;")
-                self.emit_line("    while (count >= 8) {")
-                self.emit_line("        if (*(const uint64_t*)p1 != *(const uint64_t*)p2) break;")
-                self.emit_line("        p1 += 8; p2 += 8; count -= 8;")
-                self.emit_line("    }")
-                self.emit_line("    while (count--) {")
-                self.emit_line("        if (*p1 != *p2) return (unsigned char)*p1 - (unsigned char)*p2;")
-                self.emit_line("        p1++; p2++;")
-                self.emit_line("    }")
-                self.emit_line("    return 0;")
-                self.emit_line("}")
-
-            if 'memmove' in used_mem and 'memmove' not in user_impls:
-                self.emit_line("static inline void* cbl_memmove(void *dest, const void *src, size_t count) {")
-                self.emit_line("    char *d = (char*)dest; const char *s = (const char*)src;")
-                self.emit_line("    if (d < s) { while (count--) *d++ = *s++; }")
-                self.emit_line("    else { d += count; s += count; while (count--) *--d = *--s; }")
-                self.emit_line("    return dest;")
-                self.emit_line("}")
-
-            if 'strcmp' in used_mem and 'strcmp' not in user_impls:
-                self.emit_line("static inline int cbl_strcmp(const char *s1, const char *s2) {")
-                self.emit_line("    while (*s1 && (*s1 == *s2)) { s1++; s2++; }")
-                self.emit_line("    return *(const unsigned char*)s1 - *(const unsigned char*)s2;")
-                self.emit_line("}")
-
-            if 'strlen' in used_mem and 'strlen' not in user_impls:
-                self.emit_line("static inline size_t cbl_strlen(const char *s) {")
-                self.emit_line("    size_t len = 0;")
-                self.emit_line("    while (s[len]) len++;")
-                self.emit_line("    return len;")
-                self.emit_line("}")
+            if 'isdigit' in used_string_ext and 'isdigit' not in user_impls:
+                self.emit_line("static inline int cbl_isdigit(int c) { return c >= '0' && c <= '9'; }")
+            if 'isalpha' in used_string_ext and 'isalpha' not in user_impls:
+                self.emit_line("static inline int cbl_isalpha(int c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }")
+            if 'isspace' in used_string_ext and 'isspace' not in user_impls:
+                self.emit_line("static inline int cbl_isspace(int c) { return c == ' ' || c == '\\t' || c == '\\n' || c == '\\r' || c == '\\v' || c == '\\f'; }")
+            if 'toupper' in used_string_ext and 'toupper' not in user_impls:
+                self.emit_line("static inline int cbl_toupper(int c) { return (c >= 'a' && c <= 'z') ? c - 32 : c; }")
+            if 'tolower' in used_string_ext and 'tolower' not in user_impls:
+                self.emit_line("static inline int cbl_tolower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }")
             self.emit_line()
 
         if 'memcmp' in self.used_externs or 'strcmp' in self.used_externs or 'flux_string_eq' in self.used_externs:
@@ -1148,6 +1138,28 @@ class CBLCodeEmitter:
             self.emit_line("}")
             self.emit_line()
 
+        if self.use_libc:
+            self.emit_line("#undef main")
+            self.emit_line("int main(int argc, char** argv) {")
+            if has_globals: self.emit_line("    CblerrInitGlobals();")
+            self.emit_line("#if defined(_WIN32)")
+            self.emit_line("    SetConsoleOutputCP(65001);")
+            self.emit_line("#endif")
+            self.emit_line("    cblerr_main();")
+            self.emit_line("    return 0;")
+            self.emit_line("}")
+            self.emit_line()
+            
+            if self.target == 'windows':
+                self.emit_line("#if defined(_WIN32)")
+                self.emit_line("int __stdcall WinMain(void* hInstance, void* hPrevInstance, char* lpCmdLine, int nCmdShow) {")
+                if has_globals: self.emit_line("    CblerrInitGlobals();")
+                self.emit_line("    cblerr_main();")
+                self.emit_line("    return 0;")
+                self.emit_line("}")
+                self.emit_line("#endif")
+            return
+
         main_func = next((f for f in self.program.functions if f.name == 'main'), None)
         main_returns_void = main_func and (main_func.return_type == 'void' or main_func.return_type is None)
 
@@ -1158,7 +1170,12 @@ class CBLCodeEmitter:
                 self.emit_line("        CblerrInitMsvcrt();")
                 if has_globals: self.emit_line("        CblerrInitGlobals();")
                 self.emit_line("    }")
-                self.emit_line("    return 1; // TRUE")
+                
+                has_dllmain = any(f.name == 'DllMain' for f in self.program.functions)
+                if has_dllmain:
+                    self.emit_line("    return DllMain(hinstDLL, fdwReason, lpvReserved);")
+                else:
+                    self.emit_line("    return 1; // TRUE")
                 self.emit_line("}")
             else:
                 self.emit_line("void __stdcall WinMainCRTStartup(void) {")
@@ -1208,6 +1225,13 @@ class CBLCodeEmitter:
             'f32': 'float', 'f64': 'double', 'bool': 'bool', 'str': 'string',
             'char': 'char'
         }
+        
+        if isinstance(flux_type, str) and flux_type.startswith('[') and ']' in flux_type:
+            idx = flux_type.find(']')
+            size = flux_type[1:idx]
+            inner = flux_type[idx+1:]
+            return f"{self._get_c_type(inner)}[{size}]"
+            
         if hasattr(flux_type, 'name') and hasattr(flux_type, 'args'):
             if flux_type.name == 'array': return f"{self._get_c_type(flux_type.args[0] if flux_type.args else 'int')}*"
             if flux_type.args: return self._get_c_type(flux_type.args[0])
@@ -1222,37 +1246,18 @@ class CBLCodeEmitter:
     def _get_c_declaration(self, flux_type, name: str) -> str:
         if not isinstance(flux_type, str) or not flux_type.startswith('*fn('): 
             return f"{self._get_c_type(flux_type)} {name}"
-            
-        depth = 0
-        start = flux_type.find('(')
-        pos = start + 1
-        while pos < len(flux_type):
+        start, pos, depth = flux_type.find('('), flux_type.find('(') + 1, 1
+        while pos < len(flux_type) and depth > 0:
             if flux_type[pos] == '(': depth += 1
-            elif flux_type[pos] == ')':
-                if depth == 0: break
-                depth -= 1
+            elif flux_type[pos] == ')': depth -= 1
             pos += 1
-            
-        params_sec = flux_type[start+1:pos].strip()
-        rest = flux_type[pos+1:].strip()
+        params_sec, rest = flux_type[start+1:pos-1].strip(), flux_type[pos:].strip()
         ret = rest[2:].strip() if rest.startswith('->') else 'void'
-        
-        params = []
-        if params_sec:
-            current = []
-            p_depth = 0
-            for char in params_sec:
-                if char == '(': p_depth += 1
-                elif char == ')': p_depth -= 1
-                elif char == ',' and p_depth == 0:
-                    params.append(''.join(current).strip())
-                    current = []
-                    continue
-                current.append(char)
-            if current:
-                params.append(''.join(current).strip())
-                
+        params = [p.strip() for p in params_sec.split(',')] if params_sec else []
         param_cs = [self._get_c_type(p) for p in params] if params else ['void']
+        
+        if not name:
+            return f"{self._get_c_type(ret)} (*)({', '.join(param_cs)})"
         return f"{self._get_c_type(ret)} (*{name})({', '.join(param_cs)})"
 
     def _generate_struct_def(self, struct_def: StructDef):
@@ -1265,7 +1270,13 @@ class CBLCodeEmitter:
                 if isinstance(field_type, str) and field_type.startswith('*fn('):
                     self.emit_line(f"{self._get_c_declaration(field_type, field_name)};")
                 else:
-                    self.emit_line(f"{self._get_c_type(field_type)} {field_name};")
+                    c_type = self._get_c_type(field_type)
+                    if '[' in c_type and c_type.endswith(']'):
+                        base = c_type[:c_type.find('[')]
+                        arr = c_type[c_type.find('['):]
+                        self.emit_line(f"{base} {field_name}{arr};")
+                    else:
+                        self.emit_line(f"{c_type} {field_name};")
         self.indent_level -= 1
         self.emit_line("};")
 
@@ -1302,13 +1313,25 @@ class CBLCodeEmitter:
             value_code = self._generate_expression(global_var.value)
             if isinstance(global_var.value, (Literal, ArrayLiteral, Variable)):
                 if c_type.endswith('[]'): self.emit_line(f"{c_type[:-2]} {global_var.name}[] = {value_code};")
+                elif '[' in c_type and c_type.endswith(']'):
+                    base = c_type[:c_type.find('[')]
+                    arr = c_type[c_type.find('['):]
+                    self.emit_line(f"{base} {global_var.name}{arr} = {value_code};")
                 else: self.emit_line(f"{c_type} {global_var.name} = {value_code};")
             else:
                 if c_type.endswith('[]'): self.emit_line(f"{c_type[:-2]} {global_var.name}[];")
+                elif '[' in c_type and c_type.endswith(']'):
+                    base = c_type[:c_type.find('[')]
+                    arr = c_type[c_type.find('['):]
+                    self.emit_line(f"{base} {global_var.name}{arr};")
                 else: self.emit_line(f"{c_type} {global_var.name};")
                 self.dynamic_globals.append((global_var.name, value_code))
         else:
             if c_type.endswith('[]'): self.emit_line(f"{c_type[:-2]} {global_var.name}[];")
+            elif '[' in c_type and c_type.endswith(']'):
+                base = c_type[:c_type.find('[')]
+                arr = c_type[c_type.find('['):]
+                self.emit_line(f"{base} {global_var.name}{arr};")
             else: self.emit_line(f"{c_type} {global_var.name};")
 
     def _generate_function_signature(self, func_def: FunctionDef) -> str:
@@ -1321,11 +1344,17 @@ class CBLCodeEmitter:
                     if isinstance(ptype, str) and ptype.startswith('*fn('):
                         params.append(self._get_c_declaration(ptype, pname))
                     else:
-                        params.append(f"{self._get_c_type(ptype)} {pname}")
+                        p_c = self._get_c_type(ptype)
+                        if '[' in p_c and p_c.endswith(']'):
+                            base = p_c[:p_c.find('[')]
+                            arr = p_c[p_c.find('['):]
+                            params.append(f"{base} {pname}{arr}")
+                        else:
+                            params.append(f"{p_c} {pname}")
         params_str = ", ".join(params) if params else "void"
         
         if getattr(func_def, 'is_vararg', False):
-            if params_str == "void": params_str = "..."
+            if params_str == "void": params_str = ""
             else: params_str += ", ..."
         
         call_conv = " __stdcall" if getattr(func_def, 'is_extern', False) and self.target == 'windows' and (func_def.name.endswith('A') or func_def.name.endswith('W') or func_def.name in self.win_critical_externs) else ""
@@ -1334,7 +1363,7 @@ class CBLCodeEmitter:
     def _emit_unwind_defers(self, target_depth: int):
         for scope in reversed(self.defer_scopes[target_depth:]):
             for d in reversed(scope):
-                self.emit_line("{")
+                self.emit_line("{ // defer like from zig or ahh, go? idk")
                 self.indent_level += 1
                 for s in d.body:
                     self._generate_statement(s)
@@ -1357,6 +1386,31 @@ class CBLCodeEmitter:
                         p_c = self._get_c_declaration(ptype, pname) if isinstance(ptype, str) and ptype.startswith('*fn(') else self._get_c_type(ptype)
                         if p_c: self.local_vars_stack[-1][pname] = p_c
                     except: pass
+
+        walrus_vars = {}
+        def collect_walrus(node):
+            if not node: return
+            if isinstance(node, (list, tuple)):
+                for n in node: collect_walrus(n)
+                return
+            if type(node) in (int, float, str, bool, type(None)): return
+            if not hasattr(node, '__dict__'): return
+
+            cname = node.__class__.__name__
+            if cname == 'WalrusExpr' and getattr(node, 'var_type', None):
+                t_name = node.target.name if hasattr(node.target, 'name') else str(node.target)
+                if t_name not in walrus_vars:
+                    walrus_vars[t_name] = node.var_type
+            
+            for k, v in vars(node).items():
+                if k != 'resolved_type':
+                    collect_walrus(v)
+
+        collect_walrus(func_def.body)
+        for w_name, w_type in walrus_vars.items():
+            c_t = self._get_c_type(w_type)
+            self.emit_line(f"{c_t} {w_name};")
+            self.local_vars_stack[-1][w_name] = c_t
 
         has_explicit_return = bool(func_def.body and func_def.body[-1].__class__.__name__ == 'Return')
         if func_def.body:
@@ -1387,15 +1441,28 @@ class CBLCodeEmitter:
             else: self.emit_line("return;")
         elif cname == 'Assign':
             target_str = self._generate_expression(stmt.target) if not isinstance(stmt.target, str) else stmt.target
-            value_str = self._generate_expression(stmt.value)
+            value_str = self._generate_expression(stmt.value) if getattr(stmt, 'value', None) is not None else None
             
             var_name = stmt.target if isinstance(stmt.target, str) else getattr(stmt.target, 'name', None)
             
             if getattr(stmt, 'var_type', None):
                 c_type = self._get_c_type(stmt.var_type)
-                self.emit_line(f"{c_type} {target_str} = {value_str};")
+                
                 if self.local_vars_stack and var_name: 
                     self.local_vars_stack[-1][var_name] = c_type
+                
+                if '[' in c_type and c_type.endswith(']'):
+                    base = c_type[:c_type.find('[')]
+                    arr = c_type[c_type.find('['):]
+                    if value_str is None:
+                        self.emit_line(f"{base} {target_str}{arr} = {{0}};")
+                    else:
+                        self.emit_line(f"{base} {target_str}{arr} = {value_str};")
+                else:
+                    if value_str is None:
+                        self.emit_line(f"{c_type} {target_str} = {{0}};")
+                    else:
+                        self.emit_line(f"{c_type} {target_str} = {value_str};")
             else:
                 self.emit_line(f"{target_str} = {value_str};")
         elif cname == 'IfStmt':
@@ -1588,6 +1655,8 @@ class CBLCodeEmitter:
             left, right = self._generate_expression(expr.left), self._generate_expression(expr.right)
             if expr.op == '**': return f"pow({left}, {right})"
             op_map = {'+': '+', '-': '-', '*': '*', '/': '/', '%': '%', '&': '&', '|': '|', '^': '^', '<<': '<<', '>>': '>>'}
+            if expr.op in ('&', '|', '^', '<<', '>>'):
+                return f"((int64_t)({left}) {op_map.get(expr.op, expr.op)} (int64_t)({right}))"
             return f"({left} {op_map.get(expr.op, expr.op)} {right})"
         
         elif cname == 'Compare':
@@ -1619,19 +1688,8 @@ class CBLCodeEmitter:
                     pool_name = self.string_pool.get(fast_val, '((string){(char*)"",0})')
                     return f"Cblerr_print_fast({pool_name})"
                 
-                if not getattr(expr, 'args', None):
-                    return "0"
-                    
-                prints = []
-                for arg in expr.args:
-                    arg_code = self._generate_expression(arg)
-                    prints.append(f"Cblerr_print_string({arg_code})")
-                    
-                if prints:
-                    if len(prints) == 1:
-                        return prints[0]
-                    return "(" + ", ".join(prints) + ", 0)"
-                return "0"
+                arg = expr.args[0]
+                return f"Cblerr_print_string({self._generate_expression(arg)})"
             
             if fname == 'len':
                 if not expr.args: return '0'
@@ -1671,7 +1729,15 @@ class CBLCodeEmitter:
             return f"{obj}->{expr.field}" if use_arrow else f"{obj}.{expr.field}"
         
         elif cname == 'Dereference': return f"(*{self._generate_expression(expr.ptr)})"
-        elif cname == 'CastExpr': return f"(({self._get_c_type(expr.target_type)}){self._generate_expression(expr.expr)})"
+        
+        elif cname == 'CastExpr':
+            tgt_t = expr.target_type
+            if isinstance(tgt_t, str) and tgt_t.startswith('*fn('):
+                c_tgt = self._get_c_declaration(tgt_t, "")
+                return f"(({c_tgt}){self._generate_expression(expr.expr)})"
+            else:
+                return f"(({self._get_c_type(tgt_t)}){self._generate_expression(expr.expr)})"
+                
         elif cname == 'ArrayLiteral':
             elems = [self._generate_expression(e) for e in expr.elements]
             if getattr(expr, 'is_struct_init', False): return "{" + ", ".join(elems) + "}"
@@ -1691,12 +1757,13 @@ class StandaloneCompiler:
                  link_mode: Optional[str] = None, stack_reserve: Optional[int] = None,
                  compiler_type: Optional[str] = None, icon_path: Optional[str] = None,
                  extra_files: List[str] = None, m32: bool = False, opt_level: str = '-O3',
-                 asm_out: bool = False, profile_time: bool = False,
+                 use_libc: bool = False, asm_out: bool = False, profile_time: bool = False,
                  gen_header: bool = False, native_mode: bool = False, v3_mode: bool = False, avx_mode: Optional[str] = None,
                  keep_c: bool = False, derr_flag: bool = False):
         self.source_file = Path(source_file)
         self.output_exe = Path(output_exe)
         self.opt_level = opt_level
+        self.use_libc = use_libc
         self.asm_out = asm_out
         self.profile_time = profile_time
         self.gen_header = gen_header
@@ -1708,11 +1775,10 @@ class StandaloneCompiler:
         
         target_lower = target.lower()
         self.is_dll = (target_lower == 'winlib')
-        self.is_scr = (target_lower in ('winsaver', 'screensaver'))
         if target_lower == 'wasm':
             self.target = 'wasm'
         else:
-            self.target = 'windows' if (self.is_dll or self.is_scr or target_lower == 'windows') else target_lower
+            self.target = 'windows' if self.is_dll else target_lower
         self.m32 = m32
         
         self.verbose = verbose
@@ -1737,8 +1803,17 @@ class StandaloneCompiler:
         self.is_gui_app = False
         self.packable = False
         self.res_file = None
+        self.logger = None
     
     def log(self, message: str, level: str = "INFO"):
+        if hasattr(self, 'logger') and self.logger is not None:
+            if level == "INFO": self.logger.info(message)
+            elif level == "WARN": self.logger.warn(message)
+            elif level == "ERROR": self.logger.error(message)
+            elif level == "SUCCESS": self.logger.success(message)
+            elif level == "GUIDE": self.logger.guide(message)
+            return
+
         if not self.verbose and level == "INFO":
             return
             
@@ -1772,42 +1847,43 @@ class StandaloneCompiler:
         except: return False
 
     def _print_compiler_installation_guide(self):
-        print("\n\033[1;41;37m [CRITICAL ERROR] No C Compiler Found! \033[0m")
-        print("\033[0;33mCBlerr compiles your code to C, which requires a C compiler to create the final executable.\033[0m")
-        print("\033[1;36mHere is how to install one:\033[0m\n")
+        guide = "\n\033[1;41;37m [CRITICAL ERROR] No C Compiler Found! \033[0m\n"
+        guide += "\033[0;33mCBlerr compiles your code to C, which requires a C compiler to create the final executable.\033[0m\n"
+        guide += "\033[1;36mHere is how to install one:\033[0m\n\n"
         
         if platform.system() == "Windows":
-            print("\033[1;32mOption 1: MSYS2 / MinGW-w64 (Recommended, GCC)\033[0m")
-            print("  1. Download MSYS2 from \033[4mhttps://www.msys2.org/\033[0m")
-            print("  2. Install it and open the 'MSYS2 UCRT64' terminal.")
-            print("  3. Run: \033[1;37mpacman -S mingw-w64-ucrt-x86_64-gcc\033[0m")
-            print("  4. Add 'C:\\msys64\\ucrt64\\bin' (or mingw64\\bin) to your Windows PATH environment variable.\n")
+            guide += "\033[1;32mOption 1: MSYS2 / MinGW-w64 (Recommended, GCC)\033[0m\n"
+            guide += "  1. Download MSYS2 from \033[4mhttps://www.msys2.org/\033[0m\n"
+            guide += "  2. Install it and open the 'MSYS2 UCRT64' terminal.\n"
+            guide += "  3. Run: \033[1;37mpacman -S mingw-w64-ucrt-x86_64-gcc\033[0m\n"
+            guide += "  4. Add 'C:\\msys64\\ucrt64\\bin' (or mingw64\\bin) to your Windows PATH environment variable.\n\n"
             
-            print("\033[1;32mOption 2: LLVM / Clang\033[0m")
-            print("  1. Download the LLVM installer from \033[4mhttps://github.com/llvm/llvm-project/releases\033[0m")
-            print("  2. During installation, select 'Add LLVM to the system PATH for all users'.\n")
+            guide += "\033[1;32mOption 2: LLVM / Clang\033[0m\n"
+            guide += "  1. Download the LLVM installer from \033[4mhttps://github.com/llvm/llvm-project/releases\033[0m\n"
+            guide += "  2. During installation, select 'Add LLVM to the system PATH for all users'.\n\n"
             
-            print("\033[1;32mOption 3: Microsoft Visual Studio (MSVC)\033[0m")
-            print("  1. Download Visual Studio Community from \033[4mhttps://visualstudio.microsoft.com/\033[0m")
-            print("  2. Install the 'Desktop development with C++' workload.\n")
+            guide += "\033[1;32mOption 3: Microsoft Visual Studio (MSVC)\033[0m\n"
+            guide += "  1. Download Visual Studio Community from \033[4mhttps://visualstudio.microsoft.com/\033[0m\n"
+            guide += "  2. Install the 'Desktop development with C++' workload.\n"
         elif platform.system() == "Linux":
-            print("\033[1;32mUbuntu / Debian:\033[0m")
-            print("  Run: \033[1;37msudo apt update && sudo apt install build-essential clang\033[0m\n")
+            guide += "\033[1;32mUbuntu / Debian:\033[0m\n"
+            guide += "  Run: \033[1;37msudo apt update && sudo apt install build-essential clang\033[0m\n\n"
             
-            print("\033[1;32mArch Linux:\033[0m")
-            print("  Run: \033[1;37msudo pacman -S base-devel clang\033[0m\n")
+            guide += "\033[1;32mArch Linux:\033[0m\n"
+            guide += "  Run: \033[1;37msudo pacman -S base-devel clang\033[0m\n\n"
             
-            print("\033[1;32mFedora:\033[0m")
-            print("  Run: \033[1;37msudo dnf groupinstall \"C Development Tools and Libraries\" && sudo dnf install clang\033[0m\n")
+            guide += "\033[1;32mFedora:\033[0m\n"
+            guide += "  Run: \033[1;37msudo dnf groupinstall \"C Development Tools and Libraries\" && sudo dnf install clang\033[0m\n"
         else:
-            print("\033[1;32mApple macOS:\033[0m")
-            print("  1. Open Terminal.")
-            print("  2. Run: \033[1;37mxcode-select --install\033[0m")
-            print("  3. Follow the prompt to install the command line tools.\n")
-            print("\033[1;32mOther OS:\033[0m")
-            print("  Please install GCC or Clang using your system's package manager.\n")
+            guide += "\033[1;32mApple macOS:\033[0m\n"
+            guide += "  1. Open Terminal.\n"
+            guide += "  2. Run: \033[1;37mxcode-select --install\033[0m\n"
+            guide += "  3. Follow the prompt to install the command line tools.\n\n"
+            guide += "\033[1;32mOther OS:\033[0m\n"
+            guide += "  Please install GCC or Clang using your system's package manager.\n"
         
-        print("\033[0;33mAfter installing, restart your terminal and try compiling again!\033[0m\n")
+        guide += "\n\033[0;33mAfter installing, restart your terminal and try compiling again!\033[0m\n"
+        self.log(guide, "GUIDE")
 
     def _is_msvc_clang(self) -> bool:
         if not hasattr(self, '_cached_is_msvc_clang'):
@@ -1827,12 +1903,15 @@ class StandaloneCompiler:
             f'-std=c11 {self.opt_level} -fno-lto -ffunction-sections -fdata-sections -fno-ident '
             '-fno-asynchronous-unwind-tables -fno-unwind-tables '
             '-fno-exceptions -fno-math-errno '
-            '-mno-stack-arg-probe -fno-builtin '
+            '-mno-stack-arg-probe '
             '-Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-int '
             '-Wno-discarded-qualifiers -Wno-implicit-function-declaration -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast'
         )
         
-        is_msvc = (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows')
+        if not self.use_libc:
+            flags += ' -fno-builtin'
+            
+        is_msvc = (compiler == 'clang' and self._is_msvc_clang())
         if not is_msvc:
             flags += ' -s -fmerge-all-constants'
             if self.opt_level == '-Os':
@@ -1862,7 +1941,7 @@ class StandaloneCompiler:
     
     def _get_linker_flags(self, compiler: str = 'gcc') -> str:
         flags = ['-fno-lto']
-        is_msvc = (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows')
+        is_msvc = (compiler == 'clang' and self._is_msvc_clang())
         
         if self.m32 and self.target != 'wasm':
             flags.append('-m32')
@@ -1872,12 +1951,12 @@ class StandaloneCompiler:
             
             if is_msvc:
                 flags.extend([
-                    '-nostartfiles', '-nostdlib',
-                    f'-Wl,-entry:{entry_point}',
-                    '-Wl,-nodefaultlib',
                     '-Wl,-align:4096', 
                     '-Wl,-filealign:512'
                 ])
+                if not self.use_libc:
+                    flags.extend(['-nostartfiles', '-nostdlib', f'-Wl,-entry:{entry_point}', '-Wl,-nodefaultlib'])
+                
                 if self.is_dll:
                     flags.extend(['-shared'])
                 else:
@@ -1886,10 +1965,10 @@ class StandaloneCompiler:
                 
                 flags.extend(['-Wl,-opt:ref', '-Wl,-opt:icf'])
             else:
-                flags.extend([
-                    '-nostartfiles', '-nostdlib', f'-Wl,--entry={entry_point}',
-                    '-Wl,--build-id=none', '-Wl,--no-seh'
-                ])
+                flags.extend(['-Wl,--build-id=none', '-Wl,--no-seh'])
+                if not self.use_libc:
+                    flags.extend(['-nostartfiles', '-nostdlib', f'-Wl,--entry={entry_point}'])
+                
                 if self.is_dll:
                     flags.extend(['-shared', '-Wl,--export-all-symbols'])
                 else:
@@ -1897,15 +1976,20 @@ class StandaloneCompiler:
                     flags.append(f'-Wl,--subsystem,{subsys}')
                 
                 flags.append('-Wl,--gc-sections')
-                
-                if compiler in ('gcc', 'clang'):
+                if compiler == 'gcc':
                     flags.extend(['-Wl,--file-alignment=1', '-Wl,--section-alignment=1'])
                 
         elif self.target == 'linux':
             if self.link_mode == 'static' or platform.system() == 'Windows': 
-                flags.extend(['-nostdlib', '-static', '-Wl,--build-id=none'])
+                flags.extend(['-static', '-Wl,--build-id=none'])
+                if not self.use_libc:
+                    flags.append('-nostdlib')
             else:
-                flags.extend(['-lc', '-lm', '-lgcc', '-Wl,--hash-style=sysv'])
+                flags.extend(['-Wl,--hash-style=sysv'])
+                if not self.use_libc:
+                    flags.extend(['-lc', '-lm', '-lgcc'])
+                else:
+                    flags.extend(['-lm'])
             
             if compiler in ('gcc', 'clang', 'lld'):
                 flags.append('-Wl,--gc-sections')
@@ -1917,30 +2001,6 @@ class StandaloneCompiler:
                 flags.append(f'-Wl,--stack,{self.stack_reserve}')
                 
         return ' '.join(flags)
-
-    def _get_windows_libs(self, compiler: str) -> List[str]:
-        libs = ['kernel32', 'user32']
-        if compiler == 'gcc':
-            libs.append('ntdll')
-            
-        code = self.source_code.lower()
-        if 'opengl' in code or 'wgl' in code or 'glclear' in code or 'glbegin' in code or 'glflush' in code:
-            libs.append('opengl32')
-        if 'winmm' in code or 'mci' in code or 'playsound' in code or 'timegettime' in code or 'waveout' in code:
-            libs.append('winmm')
-        if 'gdi32' in code or 'bitblt' in code or 'createcompatible' in code or 'selectobject' in code or 'createdib' in code or 'stretchdibits' in code or 'setdibits' in code or 'deleteobject' in code or 'createfont' in code or 'choosepixelformat' in code or 'swapbuffers' in code:
-            libs.append('gdi32')
-        if 'advapi32' in code or 'regopen' in code or 'regcreate' in code or 'regset' in code or 'crypt' in code:
-            libs.append('advapi32')
-        if 'shell32' in code or 'shellexecute' in code or 'dragaccept' in code or 'shget' in code:
-            libs.append('shell32')
-        if 'ole32' in code or 'coinitialize' in code or 'cocreate' in code:
-            libs.append('ole32')
-            
-        if compiler == 'msvc' or (compiler == 'clang' and self._is_msvc_clang() and self.target != 'windows'):
-            return [lib + '.lib' for lib in libs]
-        else:
-            return ['-l' + lib for lib in libs]
 
     def _compile_resources(self) -> Optional[str]:
         if not self.is_windows or not self.icon_path:
@@ -1969,7 +2029,7 @@ class StandaloneCompiler:
         return None
 
     def _prepare_output_file(self):
-        for p in (self.output_exe, self.output_exe.with_suffix('.exe'), self.output_exe.with_suffix('.scr')):
+        for p in (self.output_exe, self.output_exe.with_suffix('.exe')):
             try:
                 if p.exists():
                     p.unlink()
@@ -1983,7 +2043,7 @@ class StandaloneCompiler:
         debugger = init_debugger(DebugLevel.INFO)
         self.debugger = debugger
         try:
-            target_str = f"{self.target.upper()} (DLL: {self.is_dll}, SCR: {self.is_scr}, 32-bit: {self.m32})"
+            target_str = f"{self.target.upper()} (DLL: {self.is_dll}, 32-bit: {self.m32}, LibC: {self.use_libc})"
             self.log(f"CBlerr Console Compiler (CCC)\nTarget OS: {target_str}\nOutput: {self.output_exe}")
             
             self.log("\n[1/9] Reading code...")
@@ -1996,16 +2056,12 @@ class StandaloneCompiler:
                 self.is_gui_app = is_gui_app_code(self.source_code)
             self.packable = is_packable_code(self.source_code)
             
-            if self.is_gui_app and self.target == 'windows' and not self.is_dll and not self.is_scr:
+            if self.is_gui_app and self.target == 'windows' and not self.is_dll:
                 self.packable = False
                 self.log("  [+] Looks like a GUI application! (Packing disabled)")
             elif self.is_dll:
                 self.packable = False
                 self.log("  [+] Compiling as a DLL. (Packing disabled to keep it safe!)")
-            elif self.is_scr:
-                self.is_gui_app = True
-                self.packable = False
-                self.log("  [+] Compiling as a Windows Screensaver (.scr).")
             elif self.target == 'wasm':
                 self.packable = False
                 self.log("  [+] Targeting WebAssembly. (No PE packers needed)")
@@ -2062,8 +2118,8 @@ class StandaloneCompiler:
             perf_times['Monomorphization'] = t_mono - t_parse
 
             self.log("\n[5/9] AST Optimization (Const Fold & DCE)...")
-            ast = fold_constants(ast, debugger)
-            ast = run_dce(ast, is_lib=(self.is_dll or self.target == 'wasm'))
+            ast = fold_constants(ast)
+            ast = run_dce(ast)
 
             t_opt = time.perf_counter()
             perf_times['Optimizer'] = t_opt - t_mono
@@ -2074,19 +2130,13 @@ class StandaloneCompiler:
             except TypeCheckError as e:
                 self.log(f"\n[TYPE ERROR] Found {len(e.errors)} error(s):", "ERROR")
                 for err in e.errors:
-                    m = re.match(r"Line (\d+|\?): (.*)", err)
-                    if m and m.group(1) != '?':
-                        lineno = int(m.group(1))
-                        msg = m.group(2)
-                        syn_err = SyntaxError(msg)
-                        syn_err.lineno = lineno
-                        try:
-                            debugger.display_syntax_error(syn_err, source=self.source_code, filename=str(self.source_file))
-                        except Exception:
-                            print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
-                    else:
-                        print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
-                ans = input("\n\033[1;33mDo you want to continue compilation despite type errors? [y/N]: \033[0m").strip().lower()
+                    print(f"\033[31m[ERROR]\033[0m {err}", file=sys.stderr)
+                
+                if hasattr(self, 'logger') and self.logger:
+                    ans = self.logger.prompt("\nDo you want to continue compilation despite type errors? [y/N]: ")
+                else:
+                    ans = input("\n\033[1;33mDo you want to continue compilation despite type errors? [y/N]: \033[0m").strip().lower()
+                    
                 if ans not in ('y', 'yes'):
                     return False
             except Exception as e:
@@ -2108,7 +2158,8 @@ class StandaloneCompiler:
                 module_name=self.source_file.stem,
                 source_filename=str(self.source_file.absolute().as_posix()),
                 link_mode=self.link_mode,
-                is_gui_app=self.is_gui_app
+                is_gui_app=self.is_gui_app,
+                use_libc=self.use_libc
             )
             c_code = generator.generate(ast)
 
@@ -2162,14 +2213,14 @@ class StandaloneCompiler:
                     except Exception as e:
                         self.log(f"Just a heads-up: couldn't clean up some temp files: {e}", "WARN")
 
-                print("\033[92mCompilation successful!\033[0m")
+                self.log("Compilation successful!", "SUCCESS")
                 
                 if self.profile_time:
-                    print("\n\033[1;36m=== Profiling Results ===\033[0m")
+                    prof_msg = "\n=== Profiling Results ===\n"
                     for k, v in perf_times.items():
-                        color = "\033[1;32m" if k == 'Total' else "\033[33m"
-                        print(f"  {k.ljust(20)} : {color}{v * 1000:.2f} ms\033[0m")
-                    print("\033[1;36m=========================\033[0m\n")
+                        prof_msg += f"  {k.ljust(25)} : {v * 1000:.2f} ms\n"
+                    prof_msg += "========================="
+                    self.log(prof_msg, "INFO")
 
             return success
 
@@ -2255,25 +2306,25 @@ class StandaloneCompiler:
             success = False
             
             if comp == 'msvc':
-                success = self._compile_msvc()
+                success = self._compile_msvc(is_last_attempt=is_last)
             elif comp == 'clang':
                 bare_metal = (self.target == 'linux' and (platform.system() == 'Windows' or self.link_mode == 'static'))
-                success = self._compile_clang(bare_metal=bare_metal)
+                success = self._compile_clang(bare_metal=bare_metal, is_last_attempt=is_last)
             elif comp == 'gcc':
                 if self.target == 'windows':
-                    success = self._compile_mingw()
+                    success = self._compile_mingw(is_last_attempt=is_last)
                 else:
-                    success = self._compile_gcc()
+                    success = self._compile_gcc(is_last_attempt=is_last)
                     
             if success:
                 return True
             else:
                 if not is_last:
-                    self.log(f"\n[!] Compilation with {comp.upper()} failed. Falling back to the next compiler...", "WARN")
+                    self.log(f"Compilation with {comp.upper()} failed. Falling back to another compiler...", "WARN")
                 
         return False
 
-    def _compile_msvc(self) -> bool:
+    def _compile_msvc(self, is_last_attempt: bool = True) -> bool:
         self.log("Trying MSVC...")
         try:
             cl_exe = self._find_msvc_cl()
@@ -2282,7 +2333,10 @@ class StandaloneCompiler:
             srcs = [str(self.c_file)] + self.extra_files
 
             msvc_align = '/ALIGN:16'
-            msvc_link_flags = f'/NODEFAULTLIB /LTCG /INCREMENTAL:NO /OPT:REF /OPT:ICF {msvc_align}'
+            msvc_link_flags = f'/LTCG /INCREMENTAL:NO /OPT:REF /OPT:ICF {msvc_align}'
+            
+            if not self.use_libc:
+                msvc_link_flags += ' /NODEFAULTLIB'
             
             if self.m32:
                 msvc_link_flags += ' /MACHINE:X86'
@@ -2290,10 +2344,12 @@ class StandaloneCompiler:
                 msvc_link_flags += ' /MACHINE:X64'
                 
             if self.is_dll:
-                msvc_link_flags += ' /DLL /ENTRY:DllMainCRTStartup'
+                if not self.use_libc: msvc_link_flags += ' /ENTRY:DllMainCRTStartup'
+                msvc_link_flags += ' /DLL'
             else:
                 msvc_link_flags += ' /SUBSYSTEM:WINDOWS' if self.is_gui_app else ' /SUBSYSTEM:CONSOLE'
-                msvc_link_flags += ' /ENTRY:WinMainCRTStartup'
+                if not self.use_libc:
+                    msvc_link_flags += ' /ENTRY:WinMainCRTStartup'
                 
             if self.stack_reserve: msvc_link_flags += f' /STACK:{self.stack_reserve}'
 
@@ -2308,24 +2364,27 @@ class StandaloneCompiler:
             elif self.m32:
                 msvc_opt += ' /arch:SSE2'
             
+            msvc_libs_list = ['opengl32.lib', 'winmm.lib', 'kernel32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'shell32.lib', 'ole32.lib', 'ws2_32.lib', 'psapi.lib', 'shlwapi.lib', 'gdiplus.lib', 'comdlg32.lib']
+            
             if self.asm_out:
                 cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + [f'/Fa{self.output_exe}', '/c', '/FAs']
             else:
-                cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + ([self.res_file] if self.res_file else []) + [f'/Fe{self.output_exe}', '/link'] + msvc_link_flags.split() + self._get_windows_libs('msvc')
+                cmd = [cl_exe] + f'{msvc_opt} /GS- /GR- /Zc:threadSafeInit- /Oi /Gy /wd4047 /wd4024 /wd4311 /wd4312 /wd4244 /wd4090'.split() + srcs + ([self.res_file] if self.res_file else []) + [f'/Fe{self.output_exe}', '/link'] + msvc_link_flags.split() + msvc_libs_list
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
-            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists() or self.output_exe.with_suffix('.scr').exists()):
+            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists()):
                 return True
                 
-            self.log(f"\n[!] Compiler output for MSVC:", "ERROR")
-            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            if is_last_attempt:
+                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            self.log(f"Compiler execution failed: {e}", "ERROR")
+            if is_last_attempt:
+                self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
     
-    def _compile_clang(self, bare_metal: bool = False) -> bool:
+    def _compile_clang(self, bare_metal: bool = False, is_last_attempt: bool = True) -> bool:
         desc = "WebAssembly Build" if self.target == 'wasm' else ("optimized ELF build" if self.target == 'linux' and not bare_metal else "optimized freestanding PE/ELF build")
         self.log(f"Trying Clang ({desc})...")
         try:
@@ -2334,18 +2393,13 @@ class StandaloneCompiler:
             
             if self.target == 'linux':
                 cmd.append('--target=x86_64-linux-gnu')
-                if bare_metal or platform.system() == 'Windows':
+                if (bare_metal or platform.system() == 'Windows') and not self.use_libc:
                     cmd.extend(['-ffreestanding', '-nostdlib', '-nostartfiles'])
                 if platform.system() == 'Windows':
                     cmd.append('-fuse-ld=lld')
             elif self.target == 'wasm':
                 cmd.append('--target=wasm32-unknown-unknown')
-                cmd.append('-nostdlib')
-            elif self.target == 'windows':
-                target_triple = "i686-w64-mingw32" if self.m32 else "x86_64-w64-mingw32"
-                cmd.append(f'--target={target_triple}')
-                if platform.system() == 'Windows':
-                    cmd.append('-fuse-ld=lld')
+                if not self.use_libc: cmd.append('-nostdlib')
             
             cmd += self._get_compiler_flags('clang').split() + srcs + ([self.res_file] if self.res_file and not self.asm_out else [])
             
@@ -2366,8 +2420,11 @@ class StandaloneCompiler:
                             '-Wl,--no-rosegment'    
                         ])
                 elif self.target == 'windows':
-                    cmd.append('-Wl,-s')                 
-                    cmd.extend(self._get_windows_libs('clang'))
+                    if not self._is_msvc_clang():
+                        cmd.append('-Wl,-s')                 
+                    cmd.extend([
+                        '-lopengl32', '-lwinmm', '-lkernel32', '-luser32', '-lgdi32', '-ladvapi32', '-lshell32', '-lole32', '-lws2_32', '-lpsapi', '-lshlwapi', '-lgdiplus', '-lcomdlg32'
+                    ])
                 elif self.target == 'wasm':
                     cmd.extend([
                         '-mbulk-memory',
@@ -2384,14 +2441,15 @@ class StandaloneCompiler:
                     self.output_exe.with_suffix('.exe').replace(self.output_exe)
                 return True
                 
-            self.log(f"\n[!] Compiler output for CLANG:", "ERROR")
-            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            if is_last_attempt:
+                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            self.log(f"Compiler execution failed: {e}", "ERROR")
+            if is_last_attempt:
+                self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
-    def _compile_mingw(self) -> bool:
+    def _compile_mingw(self, is_last_attempt: bool = True) -> bool:
         self.log("Trying MinGW (gcc)...")
         try:
             srcs = [str(self.c_file)] + self.extra_files
@@ -2427,21 +2485,22 @@ class StandaloneCompiler:
             cmd += ['-o', str(self.output_exe)]
             
             if not self.asm_out:
-                cmd += self._get_linker_flags('gcc').split() + self._get_windows_libs('gcc')
+                cmd += self._get_linker_flags('gcc').split() + ['-lopengl32', '-lwinmm', '-lkernel32', '-luser32', '-lntdll', '-lgdi32', '-ladvapi32', '-lshell32', '-lole32', '-lws2_32', '-lpsapi', '-lshlwapi', '-lgdiplus', '-lcomdlg32']
                 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
 
-            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists() or self.output_exe.with_suffix('.scr').exists()):
+            if result.returncode == 0 and (self.output_exe.exists() or self.output_exe.with_suffix('.exe').exists()):
                 return True
                 
-            self.log(f"\n[!] Compiler output for {compiler_bin.upper()}:", "ERROR")
-            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            if is_last_attempt:
+                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            self.log(f"Compiler execution failed: {e}", "ERROR")
+            if is_last_attempt:
+                self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
-    def _compile_gcc(self) -> bool:
+    def _compile_gcc(self, is_last_attempt: bool = True) -> bool:
         self.log("Trying GCC (Linux)...")
         try:
             cmd = ['gcc'] + self._get_compiler_flags('gcc').split() + [str(self.c_file)] + self.extra_files
@@ -2462,11 +2521,12 @@ class StandaloneCompiler:
                     self.output_exe.with_suffix('.exe').replace(self.output_exe)
                 return True
                 
-            self.log(f"\n[!] Compiler output for GCC:", "ERROR")
-            self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
+            if is_last_attempt:
+                self._handle_compile_error((result.stdout or "") + "\n" + (result.stderr or ""), self.debugger)
             return False
         except Exception as e: 
-            self.log(f"Compiler execution failed: {e}", "ERROR")
+            if is_last_attempt:
+                self.log(f"Compiler execution failed: {e}", "ERROR")
             return False
 
     def _find_msvc_cl(self) -> Optional[str]:
@@ -2489,7 +2549,7 @@ class StandaloneCompiler:
     def _handle_compile_error(self, error_output: str, debugger) -> None:
         try:
             if "undefined reference" in error_output or "ld returned 1" in error_output:
-                print(f"\n\033[31m[LINKER ERROR]\033[0m\n{error_output.strip()}", file=sys.stderr)
+                self.log(f"[LINKER ERROR]\n{error_output.strip()}", "ERROR")
                 return
 
             cbl_source = open(self.source_file, 'r', encoding='utf-8').read() if self.source_file.exists() else None
@@ -2511,16 +2571,16 @@ class StandaloneCompiler:
                 elif c_source:
                     debugger.display_syntax_error(err, source=c_source, filename=filename)
                 else:
-                    print(f"[ERROR] {filename}:{line} - {msg}", file=sys.stderr)
+                    self.log(f"{filename}:{line} - {msg}", "ERROR")
                 return
             elif m_msg:
                 if cbl_source:
                     debugger.display_syntax_error(SyntaxError(m_msg.group(1).strip()), source=cbl_source, filename=str(self.source_file))
                 else: 
-                    print(f"[ERROR] {m_msg.group(1).strip()}", file=sys.stderr)
+                    self.log(m_msg.group(1).strip(), "ERROR")
                 return
         except Exception: 
             pass
         
         if error_output.strip():
-            print(f"\n\033[31m[C COMPILER RAW ERROR]\033[0m\n{error_output.strip()}", file=sys.stderr)
+            self.log(f"[C COMPILER RAW ERROR]\n{error_output.strip()}", "ERROR")

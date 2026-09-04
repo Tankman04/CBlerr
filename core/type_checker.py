@@ -31,7 +31,20 @@ BUILTIN_SIGS = {
     'memcpy': ('*void', [('dest', '*void'), ('src', '*void'), ('count', 'int')]),
     'memmove': ('*void', [('dest', '*void'), ('src', '*void'), ('count', 'int')]),
     'memcmp': ('int', [('s1', '*void'), ('s2', '*void'), ('count', 'int')]),
-    'strcmp': ('int', [('s1', 'str'), ('s2', 'str')]),
+    
+    'strcpy': ('*char', [('dest', '*char'), ('src', '*char')]),
+    'strcat': ('*char', [('dest', '*char'), ('src', '*char')]),
+    'strchr': ('*char', [('s', '*char'), ('c', 'int')]),
+    'strstr': ('*char', [('haystack', '*char'), ('needle', '*char')]),
+    'atoi': ('int', [('s', '*char')]),
+    'itoa': ('*char', [('val', 'int'), ('buf', '*char'), ('radix', 'int')]),
+    'isdigit': ('int', [('c', 'int')]),
+    'isalpha': ('int', [('c', 'int')]),
+    'isspace': ('int', [('c', 'int')]),
+    'toupper': ('int', [('c', 'int')]),
+    'tolower': ('int', [('c', 'int')]),
+    
+    'strcmp': ('int', [('s1', '*char'), ('s2', '*char')]),
     'strlen': ('int', [('s', '*char')]),
     'sin': ('float', [('x', 'float')]),
     'cos': ('float', [('x', 'float')]),
@@ -121,8 +134,12 @@ class TypeChecker:
         if not type_name or type_name == "void": return
         base_type = type_name.lstrip('*')
         
-        if base_type.startswith('ptr<') or base_type == 'ptr': 
+        if base_type.startswith('ptr<') or base_type == 'ptr' or base_type.startswith('fn('): 
             return
+            
+        if base_type.startswith('[') and ']' in base_type:
+            idx = base_type.find(']')
+            base_type = base_type[idx+1:]
             
         if base_type not in ALLOWED_TYPES and base_type not in self.structs and base_type not in self.enums:
             self.report_error(f"Invalid type used: '{base_type}' is not allowed or not defined.", node)
@@ -131,10 +148,7 @@ class TypeChecker:
         is_ptr1 = t1.startswith('*') or 'ptr' in t1
         is_ptr2 = t2.startswith('*') or 'ptr' in t2
         
-        if is_ptr1 and is_ptr2 and op in ('+', '-', '*', '/'):
-            self.report_error("Pointer arithmetic is restricted.", node)
-            
-        if (is_ptr1 or is_ptr2) and op in ('*', '/', '%', '**', '<<', '>>', '&', '|', '^'):
+        if (is_ptr1 or is_ptr2) and op in ('*', '/', '%', '**'):
             self.report_error(f"Invalid operation '{op}' with pointer type. Explicit cast to int is required.", node)
             
         if op in ('+', '-'):
@@ -143,23 +157,6 @@ class TypeChecker:
                 self.report_error(f"Cannot perform '{op}' on pointer and '{t2}'.", node)
             if is_ptr2 and not is_ptr1 and t1 not in valid_ints:
                 self.report_error(f"Cannot perform '{op}' on '{t1}' and pointer.", node)
-
-    def has_guaranteed_return(self, body: list) -> bool:
-        if not body: return False
-        for stmt in body:
-            cname = stmt.__class__.__name__
-            if cname == 'Return':
-                return True
-            elif cname == 'IfStmt':
-                if stmt.else_body is not None:
-                    if self.has_guaranteed_return(stmt.then_body) and self.has_guaranteed_return(stmt.else_body):
-                        return True
-            elif cname == 'MatchStmt':
-                has_default = any(c.values is None for c in stmt.cases)
-                all_return = all(self.has_guaranteed_return(c.body) for c in stmt.cases)
-                if has_default and all_return:
-                    return True
-        return False
 
     def check(self, program: Program) -> Program:
         self.program = program
@@ -176,10 +173,6 @@ class TypeChecker:
             self.global_env.declare(g.name, t)
 
         for f in program.functions:
-            if getattr(f, 'is_extern', False) and f.name in BUILTIN_SIGS:
-                ret_type, params = BUILTIN_SIGS[f.name]
-                f.params = params
-                f.return_type = ret_type
             self.functions[f.name] = f
 
         for g in program.global_vars:
@@ -207,11 +200,6 @@ class TypeChecker:
             if f.body:
                 for stmt in f.body:
                     self.check_stmt(stmt)
-                    
-                if f.return_type and f.return_type != 'void':
-                    ret_type_str = self._resolve_type_name(f.return_type)
-                    if ret_type_str != 'void' and not self.has_guaranteed_return(f.body):
-                        self.report_error(f"Function '{f.name}' promises to return '{ret_type_str}', but not all execution paths return a value.", f)
                 
             self.leave_scope()
             self.current_func = None
@@ -227,8 +215,6 @@ class TypeChecker:
         if cname == 'Return':
             if stmt.value:
                 self.check_expr(stmt.value)
-                if stmt.value.__class__.__name__ == 'ArrayLiteral':
-                    self.report_error("Cannot return a local array by value (Undefined Behavior). Use dynamic allocation.", stmt)
                 
         elif cname == 'Assign':
             if getattr(stmt, 'var_type', None):
@@ -239,7 +225,7 @@ class TypeChecker:
                 elif stmt.target.__class__.__name__ == 'Variable':
                     self.env.declare(stmt.target.name, t)
             
-            val_t = self.check_expr(stmt.value)
+            val_t = self.check_expr(stmt.value) if getattr(stmt, 'value', None) is not None else getattr(stmt, 'var_type', 'void')
             
             if isinstance(stmt.target, str):
                 if not self.env.lookup(stmt.target):
@@ -325,8 +311,12 @@ class TypeChecker:
                 self.program.functions.append(fdef)
                 t = "fn"
             else:
-                self.global_env.declare(expr.name, "int")
-                t = "int"
+                if expr.name.isupper() or expr.name.startswith(('gl', 'wgl', 'GL_', 'WGL_')):
+                    self.global_env.declare(expr.name, "int")
+                    t = "int"
+                else:
+                    self.report_error(f"UndefinedSymbolError: Variable '{expr.name}' is not defined. Typo?", expr)
+                    t = "int"
                 
         elif cname == 'BinaryOp':
             lt = self.check_expr(expr.left)
@@ -349,32 +339,18 @@ class TypeChecker:
             
         elif cname == 'Call':
             fname = expr.func_name if isinstance(expr.func_name, str) else getattr(expr.func_name, 'name', '')
-            if fname in self.functions:
+            
+            looked_up = self.env.lookup(fname)
+            if looked_up and ('fn(' in looked_up):
+                if '->' in looked_up:
+                    ret = looked_up.split('->')[-1].strip()
+                else:
+                    ret = 'void'
+                t = self._resolve_type_name(ret)
+                
+            elif fname in self.functions:
                 f = self.functions[fname]
                 t = self._resolve_type_name(f.return_type)
-                
-                expected_args = len(f.params)
-                args_len = len(expr.args) if expr.args else 0
-                if f.is_vararg:
-                    if args_len < expected_args:
-                        self.report_error(f"Function '{fname}' expects at least {expected_args} arguments, got {args_len}.", expr)
-                else:
-                    if args_len != expected_args:
-                        self.report_error(f"Function '{fname}' expects {expected_args} arguments, got {args_len}.", expr)
-                        
-                for i, arg in enumerate(expr.args or []):
-                    arg_t = self.check_expr(arg)
-                    if i < expected_args:
-                        expected_t = self._resolve_type_name(f.params[i][1])
-                        if arg_t != expected_t and expected_t != "void" and arg_t != "void":
-                            if expected_t == '*void' and arg_t.startswith('*'): continue
-                            if arg_t == '*void' and expected_t.startswith('*'): continue
-                            if expected_t == 'ptr' and arg_t.startswith('*'): continue
-                            if arg_t == 'ptr' and expected_t.startswith('*'): continue
-                            if arg_t in ('int','i32','i64') and expected_t in ('int','i32','i64'): continue
-                            if arg_t in ('float','f32','f64') and expected_t in ('float','f32','f64'): continue
-                            self.report_error(f"Type mismatch in argument {i+1} for '{fname}': expected '{expected_t}', got '{arg_t}'.", expr)
-                            
             elif fname in BUILTIN_SIGS:
                 ret_type, params = BUILTIN_SIGS[fname]
                 is_vararg = fname in ('printf', 'sprintf', 'scanf')
@@ -382,23 +358,22 @@ class TypeChecker:
                 self.functions[fname] = fdef
                 self.program.functions.append(fdef)
                 t = self._resolve_type_name(ret_type)
-                
-                for arg in (expr.args or []):
-                    self.check_expr(arg)
             elif fname == 'len':
-                for arg in (expr.args or []): self.check_expr(arg)
                 t = 'int'
             elif fname in ('print', 'range'):
-                for arg in (expr.args or []): self.check_expr(arg)
                 t = 'void'
             else:
-                fdef = FunctionDef(fname, [], 'int', [], is_extern=True, is_vararg=True)
-                self.functions[fname] = fdef
-                self.program.functions.append(fdef)
-                t = "int"
+                if fname and (fname[0].isupper() or fname.startswith(('gl', 'wgl', 'al', 'sys_'))):
+                    fdef = FunctionDef(fname, [], '*void', [], is_extern=True, is_vararg=True)
+                    self.functions[fname] = fdef
+                    self.program.functions.append(fdef)
+                    t = "*void"
+                else:
+                    self.report_error(f"UndefinedSymbolError: Function '{fname}' is not defined or imported. Typo?", expr)
+                    t = "int"
                 
             for arg in (expr.args or []):
-                arg_t = getattr(arg, 'resolved_type', "int")
+                arg_t = self.check_expr(arg)
                 if arg_t in self.structs:
                     sdef = self.structs[arg_t]
                     if len(sdef.fields) > 4:
@@ -410,6 +385,8 @@ class TypeChecker:
             if arr_t.startswith('*'): t = arr_t[1:]
             elif arr_t.endswith('*'): t = arr_t[:-1]
             elif arr_t in ('str', 'string', 'flux_string'): t = 'char'
+            elif arr_t.startswith('[') and ']' in arr_t: 
+                t = arr_t[arr_t.find(']')+1:]
             else: 
                 t = arr_t
                 if not t.startswith('*'):
@@ -489,13 +466,26 @@ class TypeChecker:
                 self.validate_type(t, expr)
                 
         elif cname == 'WalrusExpr':
-            self.check_expr(expr.target)
             val_t = self.check_expr(expr.value)
             
-            target_name = expr.target if isinstance(expr.target, str) else getattr(expr.target, 'name', None)
+            target_name = None
+            if expr.target.__class__.__name__ == 'Variable':
+                target_name = expr.target.name
+            elif isinstance(expr.target, str):
+                target_name = expr.target
+                
             if target_name:
-                if not self.env.lookup(target_name):
+                looked_up = self.env.lookup(target_name)
+                if not looked_up: 
                     self.env.declare(target_name, val_t)
+                    expr.var_type = val_t 
+                else:
+                    expr.var_type = None
+                    self.check_expr(expr.target) 
+            else:
+                expr.var_type = None
+                self.check_expr(expr.target)
+                
             t = val_t
 
         if hasattr(expr, '__dict__'):
